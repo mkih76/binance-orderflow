@@ -206,6 +206,7 @@ class DashboardData:
             "oi_data": oi_data,
             "ls_data": ls_data,
             "volume_profile": self.engine.volume_profile.profile if self.engine.volume_profile.profile else {},
+            "depth": self.depth,
             "timestamp": time.time() * 1000,
         }
 
@@ -545,14 +546,29 @@ socket.on('update', (d) => {
     speedChart.update();
   }
   
-  // 订单簿
-  let domHtml = '';
-  const asks = (d.signals ? [] : []).concat([]);
-  // 简化: 从 snapshot 获取
-  if (d.vah) {
-    domHtml = '<div style="text-align:center;color:#666;padding:8px;">实时 DOM 需要 depth 数据流</div>';
+  // 订单簿 DOM
+  if (d.depth && d.depth.bids && d.depth.asks) {
+    const bids = d.depth.bids.slice(0, 8);
+    const asks = d.depth.asks.slice(0, 8).reverse();
+    const maxQty = Math.max(...bids.map(b=>b[1]), ...asks.map(a=>a[1]), 1);
+    let domHtml = '';
+    // 卖方（红）
+    asks.forEach(([price, qty]) => {
+      const pct = (qty / maxQty * 100).toFixed(0);
+      domHtml += '<div class="dom-row"><span class="dom-price" style="color:#ff4757">' + fmt(price,1) + '</span>';
+      domHtml += '<div class="dom-bar dom-bar-ask" style="width:' + pct + '%"></div>';
+      domHtml += '<span class="dom-qty" style="color:#ff4757">' + fmt(qty,2) + '</span></div>';
+    });
+    domHtml += '<div style="text-align:center;padding:4px;color:#888;border-top:1px solid #1e1e2e;border-bottom:1px solid #1e1e2e;margin:2px 0;">' + fmt(d.price,1) + '</div>';
+    // 买方（绿）
+    bids.forEach(([price, qty]) => {
+      const pct = (qty / maxQty * 100).toFixed(0);
+      domHtml += '<div class="dom-row"><span class="dom-price" style="color:#00d4aa">' + fmt(price,1) + '</span>';
+      domHtml += '<div class="dom-bar dom-bar-bid" style="width:' + pct + '%"></div>';
+      domHtml += '<span class="dom-qty" style="color:#00d4aa">' + fmt(qty,2) + '</span></div>';
+    });
+    document.getElementById('domDisplay').innerHTML = domHtml;
   }
-  document.getElementById('domDisplay').innerHTML = domHtml;
   
   // Volume Profile
   if (d.volume_profile) {
