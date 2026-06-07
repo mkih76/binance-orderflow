@@ -244,19 +244,28 @@ class DeltaTracker:
                 self.current_delta += qty
                 self.cvd += qty
         
-        # Flush 最后一个周期
+        # Flush 最后一个周期（保存到历史但不重置，保持当前值可读）
         if trades and self._period_start > 0:
-            self.history.append({
-                "time": self._period_start,
-                "delta": self.current_delta,
-                "cvd": self.cvd,
-                "buy": self.current_buy,
-                "sell": self.current_sell,
-                "price": float(trades[-1]["p"]),
-            })
-            self.current_delta = 0.0
-            self.current_buy = 0.0
-            self.current_sell = 0.0
+            # 检查是否已经有这个周期的历史记录
+            if not self.history or self.history[-1]["time"] != self._period_start:
+                self.history.append({
+                    "time": self._period_start,
+                    "delta": self.current_delta,
+                    "cvd": self.cvd,
+                    "buy": self.current_buy,
+                    "sell": self.current_sell,
+                    "price": float(trades[-1]["p"]),
+                })
+            else:
+                # 更新已有记录
+                self.history[-1] = {
+                    "time": self._period_start,
+                    "delta": self.current_delta,
+                    "cvd": self.cvd,
+                    "buy": self.current_buy,
+                    "sell": self.current_sell,
+                    "price": float(trades[-1]["p"]),
+                }
     
     def get_divergence(self, lookback=10):
         """
