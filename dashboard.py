@@ -457,8 +457,16 @@ let priceChart = new Chart(document.getElementById('priceChart'), {
 
 let deltaChart = new Chart(document.getElementById('deltaChart'), {
   type: 'bar',
-  data: { labels: [], datasets: [{ data: [], backgroundColor: [] }] },
-  options: chartOpts()
+  data: { labels: [], datasets: [{ data: [], backgroundColor: [], borderWidth: 0, barPercentage: 0.8 }] },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    animation: { duration: 0 },
+    scales: {
+      x: { display: false },
+      y: { grid: { color: '#1a1a2e' }, ticks: { color: '#666', font: { size: 10 } } }
+    },
+    plugins: { legend: { display: false } },
+  }
 });
 
 let speedChart = new Chart(document.getElementById('speedChart'), {
