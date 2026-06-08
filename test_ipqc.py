@@ -8,7 +8,10 @@ ATAS 核心功能 IPQC 验证
 import sys
 import time
 import json
-sys.path.insert(0, "/opt/binance-testnet")
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
 
 from orderflow import (
     FootprintChart, DeltaTracker, VolumeProfile,

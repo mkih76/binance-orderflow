@@ -21,16 +21,31 @@ import os
 from collections import deque
 from datetime import datetime, timezone
 
-# SOCKS5 代理
-import socks
-import socket
+# SOCKS5 代理 — 从 config 读取，不全局 monkey-patch
+import os
+import socket as _std_socket
 
-socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 1080)
-socket.socket = socks.socksocket
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
 
+def _setup_proxy():
+    """按需配置 SOCKS5 代理（仅 websocket-client 使用）"""
+    try:
+        from config import PROXY_ENABLED, SOCKS5_PROXY
+        if PROXY_ENABLED and SOCKS5_PROXY:
+            import socks
+            # 解析 socks5://127.0.0.1:1080 格式
+            proxy_str = SOCKS5_PROXY.replace("socks5://", "").replace("socks5h://", "")
+            host, port = proxy_str.split(":")
+            socks.set_default_proxy(socks.SOCKS5, host, int(port))
+            _std_socket.socket = socks.socksocket
+            return True
+    except ImportError:
+        pass
+    return False
+
+_proxy_active = _setup_proxy()
 import websocket
-
-sys.path.insert(0, "/opt/binance-testnet")
 from orderflow import (
     FootprintChart, DeltaTracker, VolumeProfile,
     ImbalanceDetector, AbsorptionDetector, ExhaustionDetector,
@@ -195,7 +210,8 @@ class BinanceWSManager:
                 self.dm.update_mark(payload)
         
         except Exception as e:
-            pass  # 忽略解析错误
+            import logging
+            logging.getLogger("realtime").warning(f"on_message 解析错误: {e}")
     
     def on_error(self, ws, error):
         print(f"  ❌ WS 错误: {error}")

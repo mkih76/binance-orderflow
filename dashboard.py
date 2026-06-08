@@ -14,17 +14,29 @@ import os
 from collections import deque
 from datetime import datetime, timezone
 
-# SOCKS5 代理
-import socks
-import socket as sock_module
-socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 1080)
-sock_module.socket = socks.socksocket
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
 
+# SOCKS5 代理 — 从 config 读取
+def _setup_proxy():
+    try:
+        from config import PROXY_ENABLED, SOCKS5_PROXY
+        if PROXY_ENABLED and SOCKS5_PROXY:
+            import socks
+            import socket as sock_module
+            proxy_str = SOCKS5_PROXY.replace("socks5://", "").replace("socks5h://", "")
+            host, port = proxy_str.split(":")
+            socks.set_default_proxy(socks.SOCKS5, host, int(port))
+            sock_module.socket = socks.socksocket
+            return True
+    except ImportError:
+        pass
+    return False
+
+_setup_proxy()
 import websocket
 from flask import Flask, render_template_string, jsonify
 from flask_socketio import SocketIO
-
-sys.path.insert(0, "/opt/binance-testnet")
 from orderflow import (
     FootprintChart, DeltaTracker, VolumeProfile,
     ImbalanceDetector, AbsorptionDetector, ExhaustionDetector,
@@ -330,6 +342,18 @@ class DashboardData:
         except:
             pass
         
+        # Footprint 数据（最近 6 根 5 分钟 K 线）
+        footprint_data = []
+        fp = self.engine.footprint
+        if fp.bars:
+            sorted_bars = sorted(fp.bars.items(), key=lambda x: x[0], reverse=True)[:6]
+            for bar_time, price_levels in sorted_bars:
+                bar_entry = {"time": bar_time, "levels": {}}
+                for price, vol in price_levels.items():
+                    bar_entry["levels"][str(price)] = {"buy": round(vol.get("buy", 0), 4), "sell": round(vol.get("sell", 0), 4)}
+                footprint_data.append(bar_entry)
+            footprint_data.reverse()  # 按时间正序
+
         return {
             "price": bid if bid else (ask if ask else 0),
             "bid": bid,
@@ -362,6 +386,7 @@ class DashboardData:
             "oi_data": oi_data,
             "ls_data": ls_data,
             "volume_profile": self.engine.volume_profile.profile if self.engine.volume_profile.profile else {},
+            "footprint": footprint_data,
             "depth": self.depth,
             "timestamp": time.time() * 1000,
         }
@@ -549,8 +574,12 @@ body { background: #0a0a0f; color: #e0e0e0; font-family: 'SF Mono', 'Fira Code',
     </div>
   </div>
 
-  <!-- 中列: 图表 -->
+  <!-- 中列: 足迹图 + 图表 -->
   <div style="display:flex;flex-direction:column;gap:8px;">
+    <div class="card" style="min-height:300px;">
+      <div class="card-title">🔥 Footprint 热力图（ATAS 风格）</div>
+      <canvas id="footprintCanvas" style="width:100%;height:260px;"></canvas>
+    </div>
     <div class="card">
       <div class="card-title">📈 价格 & CVD</div>
       <div class="chart-container"><canvas id="priceChart"></canvas></div>
@@ -693,6 +722,118 @@ let speedChart = new Chart(document.getElementById('speedChart'), {
 
 function fmt(n, d=1) { return n != null ? Number(n).toLocaleString(undefined, {minimumFractionDigits:d, maximumFractionDigits:d}) : '--'; }
 
+// Footprint 热力图渲染
+function drawFootprint(footprintData) {
+  const canvas = document.getElementById('footprintCanvas');
+  if (!canvas || !footprintData || footprintData.length === 0) return;
+  
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  
+  ctx.fillStyle = '#0a0a0f';
+  ctx.fillRect(0, 0, W, H);
+  
+  // 收集所有价格层级
+  let allPrices = new Set();
+  footprintData.forEach(bar => {
+    Object.keys(bar.levels).forEach(p => allPrices.add(parseFloat(p)));
+  });
+  allPrices = Array.from(allPrices).sort((a,b) => a - b);
+  if (allPrices.length === 0) return;
+  
+  // 计算全局最大成交量（用于颜色映射）
+  let maxVol = 0;
+  footprintData.forEach(bar => {
+    Object.values(bar.levels).forEach(v => {
+      maxVol = Math.max(maxVol, v.buy, v.sell);
+    });
+  });
+  if (maxVol === 0) return;
+  
+  const nBars = footprintData.length;
+  const padding = { top: 20, bottom: 20, left: 60, right: 10 };
+  const barAreaW = W - padding.left - padding.right;
+  const barAreaH = H - padding.top - padding.bottom;
+  const colW = barAreaW / nBars;
+  const cellH = Math.max(8, barAreaH / allPrices.length);
+  const halfCell = colW / 2 - 2;
+  
+  // 价格标签
+  ctx.fillStyle = '#666';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'right';
+  const labelStep = Math.max(1, Math.floor(allPrices.length / 15));
+  for (let i = 0; i < allPrices.length; i += labelStep) {
+    const y = padding.top + i * cellH + cellH / 2 + 3;
+    ctx.fillText(allPrices[i].toFixed(0), padding.left - 6, y);
+  }
+  
+  // 绘制每根 K 线的 footprint
+  footprintData.forEach((bar, barIdx) => {
+    const x0 = padding.left + barIdx * colW;
+    
+    // 时间标签
+    ctx.fillStyle = '#555';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    const t = new Date(bar.time * 1000);
+    ctx.fillText(t.toTimeString().slice(0,5), x0 + colW/2, H - 4);
+    
+    allPrices.forEach((price, priceIdx) => {
+      const key = price.toFixed(1);
+      const level = bar.levels[key];
+      if (!level) return;
+      
+      const y = padding.top + priceIdx * cellH;
+      const buyVol = level.buy;
+      const sellVol = level.sell;
+      
+      if (buyVol > 0) {
+        const intensity = Math.min(1, buyVol / maxVol);
+        const width = Math.max(2, intensity * halfCell);
+        ctx.fillStyle = `rgba(0, 212, 170, ${0.2 + intensity * 0.6})`;
+        ctx.fillRect(x0 + colW/2 - width, y + 1, width, cellH - 2);
+        // 数量文字
+        if (intensity > 0.15) {
+          ctx.fillStyle = `rgba(0, 212, 170, ${0.6 + intensity * 0.4})`;
+          ctx.font = '9px monospace';
+          ctx.textAlign = 'right';
+          ctx.fillText(buyVol.toFixed(1), x0 + colW/2 - 2, y + cellH/2 + 3);
+        }
+      }
+      
+      if (sellVol > 0) {
+        const intensity = Math.min(1, sellVol / maxVol);
+        const width = Math.max(2, intensity * halfCell);
+        ctx.fillStyle = `rgba(255, 71, 87, ${0.2 + intensity * 0.6})`;
+        ctx.fillRect(x0 + colW/2, y + 1, width, cellH - 2);
+        // 数量文字
+        if (intensity > 0.15) {
+          ctx.fillStyle = `rgba(255, 71, 87, ${0.6 + intensity * 0.4})`;
+          ctx.font = '9px monospace';
+          ctx.textAlign = 'left';
+          ctx.fillText(sellVol.toFixed(1), x0 + colW/2 + 2, y + cellH/2 + 3);
+        }
+      }
+    });
+  });
+  
+  // 图例
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#00d4aa';
+  ctx.fillRect(W - 130, 4, 10, 10);
+  ctx.fillText('Taker Buy', W - 116, 13);
+  ctx.fillStyle = '#ff4757';
+  ctx.fillRect(W - 60, 4, 10, 10);
+  ctx.fillText('Sell', W - 46, 13);
+}
+
 socket.on('update', (d) => {
   // 价格
   const priceEl = document.getElementById('price');
@@ -810,6 +951,9 @@ socket.on('update', (d) => {
     });
     document.getElementById('vpDisplay').innerHTML = vpHtml;
   }
+  
+  // Footprint 热力图
+  if (d.footprint) drawFootprint(d.footprint);
 });
 
 // 时钟

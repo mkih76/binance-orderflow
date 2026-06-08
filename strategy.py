@@ -16,16 +16,18 @@ import json
 import os
 from datetime import datetime, timezone
 
-sys.path.insert(0, "/opt/binance-testnet")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
 from orderflow import (
-    fetch_aggtrades, fetch_klines, fetch_depth,
+    fetch_aggtrades, fetch_aggtrades_full, fetch_klines, fetch_depth,
     FootprintChart, DeltaTracker, VolumeProfile,
     ImbalanceDetector, AbsorptionDetector, ExhaustionDetector,
     IcebergDetector, SpeedOfTape, OrderFlowSignalEngine
 )
 from trader import (
     place_order, get_positions, get_balance,
-    get_price, api_request, get_base_url, get_current_mode
+    get_price, api_request, get_base_url, get_current_mode,
+    place_stop_order, place_take_profit_order, cancel_all_orders
 )
 
 # ==================== 策略参数 ====================
@@ -71,7 +73,7 @@ CONFIG = {
 
 # ==================== 策略状态 ====================
 
-STATE_FILE = "/opt/binance-testnet/strategy_state.json"
+STATE_FILE = os.path.join(BASE_DIR, "strategy_state.json")
 
 def load_state():
     try:
@@ -324,8 +326,8 @@ def run_strategy(dry_run=False):
         print(f"\n--- 周期 {cycle} | {now.strftime('%H:%M:%S')} UTC ---")
         
         try:
-            # 1. 采集数据
-            trades = fetch_aggtrades(cfg["symbol"], limit=cfg["trade_lookback"])
+            # 1. 采集数据（分页获取最近 5 分钟完整数据）
+            trades = fetch_aggtrades_full(cfg["symbol"], minutes=5)
             if not trades:
                 print("  ⚠️ 无法获取数据")
                 time.sleep(30)
@@ -353,7 +355,7 @@ def run_strategy(dry_run=False):
                 direction = pos["direction"]
                 hold_time = (time.time() - pos["entry_time"]) / 60
                 
-                # 止损
+                # 止损（服务端止损单已下，这里是兜底检测）
                 if (direction == "long" and current_price <= sl) or \
                    (direction == "short" and current_price >= sl):
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
@@ -361,6 +363,7 @@ def run_strategy(dry_run=False):
                     print(f"  🔴 止损触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}%")
                     
                     if not dry_run:
+                        cancel_all_orders(cfg["symbol"])  # 取消服务端挂单
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
                     
@@ -371,7 +374,7 @@ def run_strategy(dry_run=False):
                     save_state(state)
                     continue
                 
-                # 止盈
+                # 止盈（服务端止盈单已下，这里是兜底检测）
                 if (direction == "long" and current_price >= tp) or \
                    (direction == "short" and current_price <= tp):
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
@@ -379,6 +382,7 @@ def run_strategy(dry_run=False):
                     print(f"  🟢 止盈触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}%")
                     
                     if not dry_run:
+                        cancel_all_orders(cfg["symbol"])  # 取消服务端挂单
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
                     
@@ -397,6 +401,7 @@ def run_strategy(dry_run=False):
                     print(f"  ⏰ 超时平仓! 持仓 {hold_time:.0f} 分钟, PnL={pnl_pct:+.2f}%")
                     
                     if not dry_run:
+                        cancel_all_orders(cfg["symbol"])
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
                     
@@ -414,11 +419,27 @@ def run_strategy(dry_run=False):
                         if new_sl > sl:
                             state["open_position"]["stop_loss"] = new_sl
                             print(f"  📍 移动止损到 {new_sl:.1f}")
+                            # 更新服务端止损单
+                            if not dry_run:
+                                cancel_all_orders(cfg["symbol"])
+                                close_side = "SELL" if direction == "long" else "BUY"
+                                sl_order = place_stop_order(cfg["symbol"], close_side, new_sl, cfg["default_qty"])
+                                if sl_order:
+                                    state["open_position"]["sl_order_id"] = sl_order.get("orderId")
+                            save_state(state)
                     elif direction == "short" and current_price <= entry - risk:
                         new_sl = entry - risk * 0.5
                         if new_sl < sl:
                             state["open_position"]["stop_loss"] = new_sl
                             print(f"  📍 移动止损到 {new_sl:.1f}")
+                            # 更新服务端止损单
+                            if not dry_run:
+                                cancel_all_orders(cfg["symbol"])
+                                close_side = "SELL" if direction == "long" else "BUY"
+                                sl_order = place_stop_order(cfg["symbol"], close_side, new_sl, cfg["default_qty"])
+                                if sl_order:
+                                    state["open_position"]["sl_order_id"] = sl_order.get("orderId")
+                            save_state(state)
                 
                 print(f"  📊 持仓中: {direction} @ {entry:.1f} | SL={state['open_position']['stop_loss']:.1f} TP={tp:.1f} | {hold_time:.0f}min")
             
@@ -454,7 +475,18 @@ def run_strategy(dry_run=False):
                             }
                             state["total_trades"] += 1
                             save_state(state)
-                            print(f"  ✅ 开仓成功!")
+                            
+                            # 下服务端止损/止盈单（程序崩溃也能触发）
+                            close_side = "SELL" if best.direction == "long" else "BUY"
+                            sl_order = place_stop_order(cfg["symbol"], close_side, best.stop_loss, cfg["default_qty"])
+                            tp_order = place_take_profit_order(cfg["symbol"], close_side, best.take_profit, cfg["default_qty"])
+                            if sl_order:
+                                state["open_position"]["sl_order_id"] = sl_order.get("orderId")
+                            if tp_order:
+                                state["open_position"]["tp_order_id"] = tp_order.get("orderId")
+                            save_state(state)
+                            
+                            print(f"  ✅ 开仓成功! 止损/止盈单已下到服务端")
                 else:
                     print(f"  ⏳ 信号不够一致 ({len(same_dir)}/{cfg['min_signal_agreement']})")
             

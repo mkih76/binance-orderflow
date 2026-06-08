@@ -22,6 +22,7 @@
 """
 
 import sys
+import os
 import json
 import requests
 from urllib.parse import urlencode
@@ -29,13 +30,18 @@ import hmac
 import hashlib
 import time
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ==================== 代理请求 ====================
 
 def get_proxies():
     """返回 SOCKS5 代理配置"""
-    from config import PROXY_ENABLED, SOCKS5_PROXY
-    if PROXY_ENABLED and SOCKS5_PROXY:
-        return {"http": SOCKS5_PROXY, "https": SOCKS5_PROXY}
+    try:
+        from config import PROXY_ENABLED, SOCKS5_PROXY
+        if PROXY_ENABLED and SOCKS5_PROXY:
+            return {"http": SOCKS5_PROXY, "https": SOCKS5_PROXY}
+    except ImportError:
+        pass
     return None
 
 def api_request(method, url, params=None, headers=None, signed=False, mode=None):
@@ -95,7 +101,7 @@ def api_request(method, url, params=None, headers=None, signed=False, mode=None)
 
 # ==================== 模式切换 ====================
 
-MODE_FILE = "/opt/binance-testnet/.current_mode"
+MODE_FILE = os.path.join(BASE_DIR, ".current_mode")
 
 def get_current_mode():
     try:
@@ -244,6 +250,84 @@ def cancel_order(symbol, order_id):
     data = api_request("DELETE", url, params, signed=True, mode=mode)
     if data:
         print(f"✅ 已撤单: {order_id}")
+        return data
+    return None
+
+def place_stop_order(symbol, side, stop_price, quantity=None):
+    """
+    下止损单（服务端执行，程序崩溃也能触发）
+    
+    Args:
+        symbol: 交易对
+        side: "SELL" (平多) 或 "BUY" (平空)
+        stop_price: 触发价格
+        quantity: 平仓数量（不传则 closePosition=true 全平）
+    """
+    mode = get_current_mode()
+    base = get_base_url(mode)
+    url = f"{base}/fapi/v1/order"
+    
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "STOP_MARKET",
+        "stopPrice": round(stop_price, 1),
+        "workingType": "MARK_PRICE",
+    }
+    
+    if quantity:
+        params["quantity"] = quantity
+    else:
+        params["closePosition"] = "true"
+    
+    data = api_request("POST", url, params, signed=True, mode=mode)
+    if data:
+        print(f"✅ 止损单已下: {side} @ {stop_price:.1f} (ID: {data.get('orderId', 'N/A')})")
+        return data
+    return None
+
+def place_take_profit_order(symbol, side, stop_price, quantity=None):
+    """
+    下止盈单（服务端执行）
+    
+    Args:
+        symbol: 交易对
+        side: "SELL" (平多) 或 "BUY" (平空)
+        stop_price: 触发价格
+        quantity: 平仓数量（不传则 closePosition=true 全平）
+    """
+    mode = get_current_mode()
+    base = get_base_url(mode)
+    url = f"{base}/fapi/v1/order"
+    
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "TAKE_PROFIT_MARKET",
+        "stopPrice": round(stop_price, 1),
+        "workingType": "MARK_PRICE",
+    }
+    
+    if quantity:
+        params["quantity"] = quantity
+    else:
+        params["closePosition"] = "true"
+    
+    data = api_request("POST", url, params, signed=True, mode=mode)
+    if data:
+        print(f"✅ 止盈单已下: {side} @ {stop_price:.1f} (ID: {data.get('orderId', 'N/A')})")
+        return data
+    return None
+
+def cancel_all_orders(symbol):
+    """撤销指定交易对的所有挂单"""
+    mode = get_current_mode()
+    base = get_base_url(mode)
+    url = f"{base}/fapi/v1/allOpenOrders"
+    params = {"symbol": symbol}
+    data = api_request("DELETE", url, params, signed=True, mode=mode)
+    if data:
+        print(f"✅ 已撤销 {symbol} 所有挂单")
         return data
     return None
 

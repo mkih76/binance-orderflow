@@ -49,6 +49,47 @@ def fetch_aggtrades(symbol="BTCUSDT", limit=1000, start_time=None, end_time=None
         return []
     return r.json()
 
+def fetch_aggtrades_full(symbol="BTCUSDT", minutes=30):
+    """
+    分页获取完整历史成交数据（突破 1000 笔限制）
+    
+    Args:
+        symbol: 交易对
+        minutes: 获取最近 N 分钟的数据
+    
+    Returns:
+        list of aggTrades，按时间排序
+    """
+    all_trades = []
+    end_time = int(time.time() * 1000)
+    start_time = end_time - minutes * 60 * 1000
+    base = "https://demo-fapi.binance.com"
+    
+    while start_time < end_time:
+        params = {
+            "symbol": symbol,
+            "limit": 1000,
+            "startTime": start_time,
+            "endTime": end_time,
+        }
+        try:
+            r = requests.get(f"{base}/fapi/v1/aggTrades", params=params,
+                             proxies=get_proxies(), timeout=15)
+            if r.status_code != 200:
+                break
+            batch = r.json()
+            if not batch:
+                break
+            all_trades.extend(batch)
+            # 下一批从最后一笔之后开始
+            start_time = batch[-1]["T"] + 1
+            time.sleep(0.1)  # 限流保护
+        except Exception as e:
+            print(f"⚠️ 数据采集异常: {e}")
+            break
+    
+    return all_trades
+
 def fetch_klines(symbol="BTCUSDT", interval="5m", limit=100):
     """获取 K 线数据"""
     base = "https://demo-fapi.binance.com"
@@ -389,7 +430,7 @@ class VolumeProfile:
             if up_vol == 0 and down_vol == 0:
                 break
             
-            if up_vol >= down_vol:
+            if up_vol >= down_vol and up_idx < len(prices):
                 accumulated += up_vol
                 vah = prices[up_idx]
                 up_idx += 1
@@ -611,6 +652,7 @@ class AbsorptionDetector:
         self.imbalance_threshold = imbalance_threshold
         self.price_impact_threshold = price_impact_threshold
         self.volume_history = deque(maxlen=100)  # 历史成交量用于计算 Z-Score
+        self.price_impact_history = deque(maxlen=50)  # 历史价格影响用于归一化
     
     def detect(self, trades, window_seconds=60):
         """
@@ -666,9 +708,12 @@ class AbsorptionDetector:
             relative_impact = price_range / mid_price * 100 if mid_price > 0 else 1
             
             # 归一化价格影响（相对于历史波动）
-            avg_price = mid_price
-            normal_impact = relative_impact / (avg_price * 0.001)  # 0.1% 作为基准
-            normal_impact = min(normal_impact, 2.0)  # 上限
+            self.price_impact_history.append(relative_impact)
+            if len(self.price_impact_history) >= 5:
+                avg_impact = sum(self.price_impact_history) / len(self.price_impact_history)
+                normal_impact = relative_impact / avg_impact if avg_impact > 0 else 1
+            else:
+                normal_impact = 1  # 数据不足，默认不算吸收
             
             # 检测吸收
             if z_score > self.z_threshold:
@@ -849,7 +894,11 @@ class IcebergDetector:
                 
                 if cv <= self.max_cv:
                     total_vol = sum(qtys)
-                    direction = "buy" if not trades[0]["m"] else "sell"  # 简化判断
+                    # 按该价格的实际成交统计方向
+                    price_trades = [t for t in trades if float(t["p"]) == price]
+                    buy_count = sum(1 for t in price_trades if not t["m"])
+                    sell_count = sum(1 for t in price_trades if t["m"])
+                    direction = "buy" if buy_count > sell_count else "sell" if sell_count > buy_count else "unknown"
                     
                     signals.append({
                         "type": "iceberg",
@@ -859,7 +908,7 @@ class IcebergDetector:
                         "total_volume": total_vol,
                         "cv": cv,
                         "z_score": z_score,
-                        "direction": "unknown",  # 需要更多上下文判断
+                        "direction": direction,  # 从该价格实际成交统计
                     })
         
         return signals
@@ -1171,10 +1220,7 @@ def run_analysis(symbol="BTCUSDT", minutes=30):
     """
     print(f"🔍 正在采集 {symbol} 最近 {minutes} 分钟的成交数据...")
     
-    # 计算需要的成交笔数（约 1000笔/分钟 for BTC）
-    limit = min(1000, minutes * 100)
-    
-    trades = fetch_aggtrades(symbol=symbol, limit=limit)
+    trades = fetch_aggtrades_full(symbol=symbol, minutes=minutes)
     if not trades:
         print("❌ 无法获取数据")
         return
