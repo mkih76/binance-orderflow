@@ -2265,6 +2265,562 @@ class EnhancedSignalEngine(OrderFlowSignalEngine):
             return "neutral", max(0, 1 - abs(total_score) / 30)
 
 
+# ==================== 市场推理引擎 ====================
+
+class MarketReasoning:
+    """
+    资深交易员式市场推理引擎
+
+    不是机械地数信号，而是像一个有经验的交易员一样：
+    1. 读懂市场结构（趋势、位置、关键价位）
+    2. 评估订单流质量（CVD是否确认价格？Delta是否背离？）
+    3. 检查交易条件（位置、确认、时机）
+    4. 给出明确的行动方案和理由
+    """
+
+    def __init__(self):
+        pass
+
+    def analyze(self, price, poc, vah, val, cvd, delta, signals, trades,
+                depth_bids=None, depth_asks=None, regime=None, atr_pct=None):
+        """
+        综合分析，输出交易员风格的推理报告
+
+        Args:
+            price: 当前价格
+            poc/vah/val: Volume Profile 关键价位
+            cvd: 累积成交量差
+            delta: 当前K线 delta
+            signals: 引擎输出的信号列表
+            trades: 最近的成交数据
+            depth_bids/depth_asks: 订单簿深度
+            regime: 市场状态（可选）
+            atr_pct: ATR百分比（可选）
+
+        Returns:
+            dict with: verdict, confidence, reasoning_steps[], action_plan{}
+        """
+        reasoning = []
+        factors_bull = []
+        factors_bear = []
+
+        # === 第一步：市场结构 ===
+        structure = self._read_structure(price, poc, vah, val, cvd, delta, trades)
+        reasoning.append(structure["thought"])
+        if structure["bias"] == "bullish":
+            factors_bull.append(("市场结构", structure["weight"]))
+        elif structure["bias"] == "bearish":
+            factors_bear.append(("市场结构", structure["weight"]))
+
+        # === 第二步：订单流质量 ===
+        flow = self._evaluate_flow(cvd, delta, price, trades, signals)
+        reasoning.append(flow["thought"])
+        if flow["bias"] == "bullish":
+            factors_bull.append(("订单流", flow["weight"]))
+        elif flow["bias"] == "bearish":
+            factors_bear.append(("订单流", flow["weight"]))
+
+        # === 第三步：交易条件 ===
+        setup = self._check_setup(price, poc, vah, val, signals, depth_bids, depth_asks)
+        reasoning.append(setup["thought"])
+        if setup["bias"] == "bullish":
+            factors_bull.append(("交易条件", setup["weight"]))
+        elif setup["bias"] == "bearish":
+            factors_bear.append(("交易条件", setup["weight"]))
+
+        # === 第四步：时机判断 ===
+        timing = self._assess_timing(signals, delta, trades)
+        reasoning.append(timing["thought"])
+        if timing["bias"] == "bullish":
+            factors_bull.append(("时机", timing["weight"]))
+        elif timing["bias"] == "bearish":
+            factors_bear.append(("时机", timing["weight"]))
+
+        # === 第五步：风险评估 ===
+        risk = self._assess_risk(price, poc, vah, val, atr_pct, regime)
+        reasoning.append(risk["thought"])
+
+        # === 综合判断 ===
+        bull_total = sum(w for _, w in factors_bull)
+        bear_total = sum(w for _, w in factors_bear)
+        net = bull_total - bear_total
+
+        verdict, confidence, verdict_reason = self._make_verdict(
+            net, bull_total, bear_total, factors_bull, factors_bear, setup, risk
+        )
+
+        # === 行动方案 ===
+        action = self._make_action_plan(
+            verdict, price, poc, vah, val, atr_pct or 0.5, setup, risk
+        )
+
+        # === 组装报告 ===
+        report = {
+            "timestamp": time.time(),
+            "time_str": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "price": price,
+            "verdict": verdict,
+            "verdict_zh": {"LONG": "做多", "SHORT": "做空", "WAIT": "观望", "AVOID": "回避"}[verdict],
+            "confidence": confidence,
+            "verdict_reason": verdict_reason,
+            "reasoning_steps": reasoning,
+            "factors_bull": factors_bull,
+            "factors_bear": factors_bear,
+            "action_plan": action,
+            "risk_note": risk["thought"],
+            "structure": structure,
+            "flow": flow,
+            "setup": setup,
+            "timing": timing,
+            "levels": {"poc": poc, "vah": vah, "val": val},
+        }
+
+        return report
+
+    def _read_structure(self, price, poc, vah, val, cvd, delta, trades):
+        """第一步：读懂市场结构"""
+        if not poc:
+            return {"thought": "📊 数据不足，无法判断市场结构", "bias": "neutral", "weight": 0}
+
+        poc_dist = (price - poc) / poc * 100
+
+        # 价格在价值区的位置
+        if vah and val:
+            if price > vah:
+                position = "价值区上方（强势区）"
+                pos_bias = "bullish"
+                pos_w = 6
+            elif price < val:
+                position = "价值区下方（弱势区）"
+                pos_bias = "bearish"
+                pos_w = 6
+            elif abs(price - poc) / poc < 0.001:
+                position = "贴近POC（重心位置）"
+                pos_bias = "neutral"
+                pos_w = 0
+            elif price > poc:
+                position = "价值区上半部"
+                pos_bias = "bullish"
+                pos_w = 3
+            else:
+                position = "价值区下半部"
+                pos_bias = "bearish"
+                pos_w = 3
+        else:
+            position = "关键价位未定"
+            pos_bias = "neutral"
+            pos_w = 0
+
+        # 价格距离关键位的远近
+        nearest_level = None
+        nearest_dist = float('inf')
+        for label, level in [("POC", poc), ("VAH", vah), ("VAL", val)]:
+            if level:
+                d = abs(price - level) / level * 100
+                if d < nearest_dist:
+                    nearest_dist = d
+                    nearest_level = label
+
+        if nearest_dist < 0.1:
+            level_note = f"紧贴{nearest_level}（{nearest_dist:.2f}%），这是关键决策区"
+        elif nearest_dist < 0.3:
+            level_note = f"靠近{nearest_level}（{nearest_dist:.2f}%），有支撑/阻力作用"
+        else:
+            level_note = f"离{nearest_level}有{nearest_dist:.2f}%距离，处于自由波动区"
+
+        # CVD 趋势
+        if cvd > 1000:
+            cvd_note = "CVD 大幅正值，买方持续主导"
+            cvd_bias = "bullish"
+            cvd_w = 5
+        elif cvd < -1000:
+            cvd_note = "CVD 大幅负值，卖方持续主导"
+            cvd_bias = "bearish"
+            cvd_w = 5
+        elif cvd > 200:
+            cvd_note = "CVD 偏正，买方略占优"
+            cvd_bias = "bullish"
+            cvd_w = 2
+        elif cvd < -200:
+            cvd_note = "CVD 偏负，卖方略占优"
+            cvd_bias = "bearish"
+            cvd_w = 2
+        else:
+            cvd_note = "CVD 接近零，多空均衡"
+            cvd_bias = "neutral"
+            cvd_w = 0
+
+        # 综合结构判断
+        thought = f"【市场结构】价格 {price:.0f} 处于{position}。{level_note}。{cvd_note}。"
+
+        # 结构偏见
+        bias_scores = {"bullish": 0, "bearish": 0}
+        if pos_bias != "neutral":
+            bias_scores[pos_bias] += pos_w
+        if cvd_bias != "neutral":
+            bias_scores[cvd_bias] += cvd_w
+
+        if bias_scores["bullish"] > bias_scores["bearish"]:
+            bias = "bullish"
+            weight = bias_scores["bullish"]
+        elif bias_scores["bearish"] > bias_scores["bullish"]:
+            bias = "bearish"
+            weight = bias_scores["bearish"]
+        else:
+            bias = "neutral"
+            weight = 0
+
+        return {
+            "thought": thought,
+            "bias": bias,
+            "weight": weight,
+            "position": position,
+            "poc_dist": poc_dist,
+            "nearest_level": nearest_level,
+            "nearest_dist": nearest_dist,
+        }
+
+    def _evaluate_flow(self, cvd, delta, price, trades, signals):
+        """第二步：评估订单流质量"""
+        # 检查 CVD 和价格是否一致
+        recent_prices = [float(t["p"]) for t in trades[-100:]]
+        price_trend = "上行" if recent_prices[-1] > recent_prices[0] else "下行" if recent_prices[-1] < recent_prices[0] else "横盘"
+
+        cvd_direction = "买方" if cvd > 0 else "卖方" if cvd < 0 else "均衡"
+
+        # 关键：CVD 和价格是否同向
+        if price_trend == "上行" and cvd > 0:
+            flow_quality = "价格上行 + CVD 正值 = 买方推动上涨，flow 确认趋势"
+            flow_confirm = True
+            bias = "bullish"
+            weight = 5
+        elif price_trend == "下行" and cvd < 0:
+            flow_quality = "价格下行 + CVD 负值 = 卖方推动下跌，flow 确认趋势"
+            flow_confirm = True
+            bias = "bearish"
+            weight = 5
+        elif price_trend == "上行" and cvd < -300:
+            flow_quality = "⚠️ 价格在涨但 CVD 为负 — 买盘虚弱，可能是空头回补而非真实买需"
+            flow_confirm = False
+            bias = "bearish"
+            weight = 7  # 背离是强信号
+        elif price_trend == "下行" and cvd > 300:
+            flow_quality = "⚠️ 价格在跌但 CVD 为正 — 卖盘虚弱，可能是多头获利了结而非真实卖压"
+            flow_confirm = False
+            bias = "bullish"
+            weight = 7
+        else:
+            flow_quality = f"价格{price_trend}，CVD {cvd_direction}主导，flow 无明显背离"
+            flow_confirm = True
+            bias = "neutral"
+            weight = 0
+
+        # Delta 强度
+        recent_deltas = []
+        for t in trades[-200:]:
+            if t.get("m"):
+                recent_deltas.append(-float(t["q"]))
+            else:
+                recent_deltas.append(float(t["q"]))
+
+        if recent_deltas:
+            last_5_delta = sum(recent_deltas[-5:])
+            avg_abs_delta = sum(abs(d) for d in recent_deltas) / len(recent_deltas)
+            if abs(last_5_delta) > avg_abs_delta * 3:
+                delta_note = f"最近5笔成交 Delta 异常强（{last_5_delta:+.2f}），有大单在行动"
+            else:
+                delta_note = f"Delta 强度正常（最近5笔 {last_5_delta:+.2f}）"
+        else:
+            delta_note = "Delta 数据不足"
+
+        thought = f"【订单流】{flow_quality}。{delta_note}。"
+
+        return {
+            "thought": thought,
+            "bias": bias,
+            "weight": weight,
+            "flow_confirm": flow_confirm,
+            "cvd": cvd,
+            "delta": delta,
+        }
+
+    def _check_setup(self, price, poc, vah, val, signals, depth_bids=None, depth_asks=None):
+        """第三步：检查是否有有效的交易 setup"""
+        setups = []
+
+        # 提取引擎信号
+        signal_map = {}
+        for s in signals:
+            src = s.get("source", "")
+            b = s.get("bias", "neutral")
+            if src not in signal_map:
+                signal_map[src] = []
+            signal_map[src].append(b)
+
+        # 检查各信号
+        has_absorption = "absorption" in signal_map
+        has_imbalance_buy = "stacked_imbalance" in signal_map and "bullish" in signal_map["stacked_imbalance"]
+        has_imbalance_sell = "stacked_imbalance" in signal_map and "bearish" in signal_map["stacked_imbalance"]
+        has_exhaustion = "exhaustion" in signal_map
+        has_iceberg = "iceberg" in signal_map
+
+        # 吸收信号
+        if has_absorption:
+            for s in signals:
+                if s.get("source") == "absorption":
+                    direction = s.get("direction", "")
+                    z = s.get("z_score", 0)
+                    if "seller" in direction:
+                        setups.append(f"卖方吸收（Z={z:.1f}）在关键价位 — 大户在接货，价格跌不动")
+                    else:
+                        setups.append(f"买方吸收（Z={z:.1f}）在关键价位 — 大户在出货，价格涨不动")
+
+        # 堆叠失衡
+        if has_imbalance_buy:
+            for s in signals:
+                if s.get("source") == "stacked_imbalance" and s.get("bias") == "bullish":
+                    levels = s.get("levels", 0)
+                    setups.append(f"买方堆叠失衡 {levels} 层 — 买盘力量集中，可能推动价格上行")
+        if has_imbalance_sell:
+            for s in signals:
+                if s.get("source") == "stacked_imbalance" and s.get("bias") == "bearish":
+                    levels = s.get("levels", 0)
+                    setups.append(f"卖方堆叠失衡 {levels} 层 — 卖盘力量集中，可能推动价格下行")
+
+        # 衰竭
+        if has_exhaustion:
+            for s in signals:
+                if s.get("source") == "exhaustion":
+                    bias = s.get("bias", "neutral")
+                    if bias == "bearish":
+                        setups.append("上涨衰竭信号 — 买方动能耗尽，注意回调风险")
+                    else:
+                        setups.append("下跌衰竭信号 — 卖方动能耗尽，注意反弹机会")
+
+        # 冰山单
+        if has_iceberg:
+            setups.append("检测到冰山单 — 有大户在暗中布局")
+
+        # 订单簿大单
+        if depth_bids and depth_asks:
+            max_bid = max(q for _, q in depth_bids) if depth_bids else 0
+            max_ask = max(q for _, q in depth_asks) if depth_asks else 0
+            if max_bid > max_ask * 2:
+                setups.append(f"买盘大单堆积（最大 {max_bid:.2f} vs 卖盘 {max_ask:.2f}）— 买方护盘意愿强")
+            elif max_ask > max_bid * 2:
+                setups.append(f"卖盘大单堆积（最大 {max_ask:.2f} vs 买盘 {max_bid:.2f}）— 卖方压盘意愿强")
+
+        # 判断 setup 质量
+        if not setups:
+            thought = "【交易条件】当前没有明显的交易 setup。等待是正确的。"
+            return {"thought": thought, "bias": "neutral", "weight": 0, "setups": setups}
+
+        # 计算 setup 方向
+        bull_keywords = ["买方", "接货", "买盘", "反弹", "上行", "护盘"]
+        bear_keywords = ["卖方", "出货", "卖盘", "回调", "下行", "压盘", "衰竭"]
+
+        bull_setups = sum(1 for s in setups if any(k in s for k in bull_keywords))
+        bear_setups = sum(1 for s in setups if any(k in s for k in bear_keywords))
+
+        if bull_setups > bear_setups:
+            bias = "bullish"
+            weight = min(bull_setups * 4, 15)
+        elif bear_setups > bull_setups:
+            bias = "bearish"
+            weight = min(bear_setups * 4, 15)
+        else:
+            bias = "neutral"
+            weight = 0
+
+        setup_text = "；".join(setups)
+        thought = f"【交易条件】发现 {len(setups)} 个交易信号：{setup_text}。"
+
+        return {"thought": thought, "bias": bias, "weight": weight, "setups": setups}
+
+    def _assess_timing(self, signals, delta, trades):
+        """第四步：时机判断 — 现在进场还是等？"""
+        # 检查是否有 cross-bar 信号（最强的时机信号）
+        has_cross_bar = any(s.get("source", "").startswith("cross_bar") for s in signals)
+
+        # 检查速度
+        momentum = "unknown"
+        for s in signals:
+            if s.get("source") == "speed_of_tape":
+                momentum = s.get("type", "unknown")
+
+        # 检查信号一致性
+        bullish_sources = set()
+        bearish_sources = set()
+        for s in signals:
+            src = s.get("source", "")
+            bias = s.get("bias", "neutral")
+            if bias == "bullish":
+                bullish_sources.add(src)
+            elif bias == "bearish":
+                bearish_sources.add(src)
+
+        n_bull = len(bullish_sources)
+        n_bear = len(bearish_sources)
+
+        # 时机评估
+        if has_cross_bar and n_bull >= 2:
+            thought = f"【时机】跨K线失衡 + {n_bull}个信号一致看多 — 时机成熟，可以进场"
+            bias = "bullish"
+            weight = 8
+        elif has_cross_bar and n_bear >= 2:
+            thought = f"【时机】跨K线失衡 + {n_bear}个信号一致看空 — 时机成熟，可以进场"
+            bias = "bearish"
+            weight = 8
+        elif n_bull >= 3:
+            thought = f"【时机】{n_bull}个多方信号共振，但缺乏跨K线确认 — 可以小仓试探"
+            bias = "bullish"
+            weight = 5
+        elif n_bear >= 3:
+            thought = f"【时机】{n_bear}个空方信号共振，但缺乏跨K线确认 — 可以小仓试探"
+            bias = "bearish"
+            weight = 5
+        elif n_bull >= 2:
+            thought = f"【时机】{n_bull}个信号偏多，但不够强 — 观望为主，等更多确认"
+            bias = "bullish"
+            weight = 2
+        elif n_bear >= 2:
+            thought = f"【时机】{n_bear}个信号偏空，但不够强 — 观望为主，等更多确认"
+            bias = "bearish"
+            weight = 2
+        else:
+            thought = "【时机】信号分散，没有明确方向 — 耐心等待"
+            bias = "neutral"
+            weight = 0
+
+        return {"thought": thought, "bias": bias, "weight": weight, "momentum": momentum}
+
+    def _assess_risk(self, price, poc, vah, val, atr_pct, regime):
+        """第五步：风险评估"""
+        risks = []
+
+        # ATR 波动率
+        if atr_pct:
+            if atr_pct > 2.0:
+                risks.append(f"波动率极高（ATR {atr_pct:.1f}%），止损要放宽，仓位要缩小")
+            elif atr_pct > 1.0:
+                risks.append(f"波动率偏高（ATR {atr_pct:.1f}%），注意控制仓位")
+            elif atr_pct < 0.3:
+                risks.append(f"波动率极低（ATR {atr_pct:.1f}%），可能是暴风雨前的宁静")
+
+        # 市场状态
+        if regime:
+            r = regime.get("regime", "unknown")
+            if r == "breakout":
+                risks.append("市场处于突破状态，追高风险大，等回踩确认更好")
+            elif r == "low_volatility":
+                risks.append("市场低波动，假突破多，等放量确认")
+
+        # 价格在关键位附近
+        if poc:
+            poc_d = abs(price - poc) / poc * 100
+            if poc_d < 0.1:
+                risks.append("价格紧贴POC，方向不明确，容易来回打脸")
+
+        if not risks:
+            thought = "【风险】当前风险可控，没有特别需要注意的。"
+        else:
+            thought = "【风险】" + "；".join(risks) + "。"
+
+        return {"thought": thought, "risks": risks}
+
+    def _make_verdict(self, net, bull_total, bear_total, factors_bull, factors_bear, setup, risk):
+        """综合判断"""
+        # 计算置信度
+        total = bull_total + bear_total
+        if total == 0:
+            return "WAIT", 30, "没有任何方向性信号，观望"
+
+        dominance = abs(net) / max(total, 1)
+
+        if net > 15 and dominance > 0.4:
+            confidence = min(90, 50 + int(dominance * 40))
+            reasons = [f"{n}({w})" for n, w in factors_bull]
+            return "LONG", confidence, f"多方主导：{', '.join(reasons)}"
+        elif net < -15 and dominance > 0.4:
+            confidence = min(90, 50 + int(dominance * 40))
+            reasons = [f"{n}({w})" for n, w in factors_bear]
+            return "SHORT", confidence, f"空方主导：{', '.join(reasons)}"
+        elif net > 8:
+            return "LONG", 45, "略偏多，但信号不够强，轻仓试探"
+        elif net < -8:
+            return "SHORT", 45, "略偏空，但信号不够强，轻仓试探"
+        else:
+            return "WAIT", 35, f"多空拉锯（多{bull_total}/空{bear_total}），等待明确方向"
+
+    def _make_action_plan(self, verdict, price, poc, vah, val, atr_pct, setup, risk):
+        """制定行动方案"""
+        if verdict == "WAIT" or verdict == "AVOID":
+            return {
+                "action": "观望",
+                "reason": "等待更好的机会",
+                "watch_for": self._what_to_watch(price, poc, vah, val, setup),
+            }
+
+        direction = "做多" if verdict == "LONG" else "做空"
+
+        # 根据 ATR 计算止损止盈
+        sl_dist = price * max(atr_pct / 100, 0.005)
+        tp_dist = sl_dist * 2  # 2R
+
+        if verdict == "LONG":
+            entry = price
+            sl = price - sl_dist
+            tp = price + tp_dist
+            # 如果有 VAH/POC 作为目标
+            if vah and vah > price and vah < price + tp_dist * 1.5:
+                tp = vah
+        else:
+            entry = price
+            sl = price + sl_dist
+            tp = price - tp_dist
+            if val and val < price and val > price - tp_dist * 1.5:
+                tp = val
+
+        risk_reward = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+
+        return {
+            "action": direction,
+            "entry": round(entry, 1),
+            "stop_loss": round(sl, 1),
+            "take_profit": round(tp, 1),
+            "risk_reward": round(risk_reward, 1),
+            "position_advice": self._position_advice(risk, verdict),
+            "watch_for": self._what_to_watch(price, poc, vah, val, setup),
+        }
+
+    def _position_advice(self, risk, verdict):
+        """仓位建议"""
+        risk_notes = risk.get("risks", [])
+        high_vol = any("波动率极高" in r for r in risk_notes)
+        breakout = any("突破状态" in r for r in risk_notes)
+
+        if high_vol or breakout:
+            return "高风险环境，用最小仓位"
+        else:
+            return "正常仓位"
+
+    def _what_to_watch(self, price, poc, vah, val, setup):
+        """观望时要关注什么"""
+        watch = []
+        if poc:
+            if price > poc:
+                watch.append(f"价格回落到POC({poc:.0f})附近是否有支撑")
+            else:
+                watch.append(f"价格反弹到POC({poc:.0f})附近是否有阻力")
+        if vah:
+            watch.append(f"VAH({vah:.0f})突破确认")
+        if val:
+            watch.append(f"VAL({val:.0f})跌破确认")
+        watch.append("CVD方向是否与价格同步")
+        watch.append("成交量是否放大")
+        return watch
+
+
 # ==================== 快捷函数 ====================
 
 def run_analysis(symbol="BTCUSDT", minutes=30):

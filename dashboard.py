@@ -40,7 +40,7 @@ from flask_socketio import SocketIO
 from orderflow import (
     FootprintChart, DeltaTracker, VolumeProfile,
     ImbalanceDetector, AbsorptionDetector, ExhaustionDetector,
-    IcebergDetector, SpeedOfTape, OrderFlowSignalEngine
+    IcebergDetector, SpeedOfTape, OrderFlowSignalEngine, MarketReasoning
 )
 from trader import get_balance, get_positions, place_order, get_base_url, get_current_mode, get_all_orders, get_my_trades, api_request
 
@@ -64,6 +64,7 @@ class DashboardData:
         
         # 分析引擎
         self.engine = OrderFlowSignalEngine(tick_size=1.0)
+        self.reasoner = MarketReasoning()
         self.signals = []
         self.consensus = "neutral"
         self.confidence = 0
@@ -150,150 +151,45 @@ class DashboardData:
         now = time.time()
         if self.analysis_report and (now - self.analysis_time) < 120:
             return self.analysis_report
-        
+
         trades = list(self.trades)[-2000:]
         if len(trades) < 100:
             return None
-        
+
         try:
             price = float(trades[-1]["p"])
             cvd = self.engine.delta.cvd
             delta = self.engine.delta.current_delta
             vah, val, poc = self.engine.volume_profile.get_value_area()
-            consensus, confidence = self.engine.get_consensus()
             speed = self.engine.speed
             momentum = speed.get_momentum() if hasattr(speed, 'get_momentum') else 'unknown'
-            
-            # === 趋势判断 ===
-            # CVD 方向
-            cvd_trend = "买方主导" if cvd > 500 else "卖方主导" if cvd < -500 else "多空均衡"
-            
-            # 价格 vs POC
-            if poc:
-                poc_dist = (price - poc) / poc * 100
-                if poc_dist > 0.3:
-                    price_pos = f"价格在 POC 上方 {poc_dist:.2f}%，偏强"
-                elif poc_dist < -0.3:
-                    price_pos = f"价格在 POC 下方 {abs(poc_dist):.2f}%，偏弱"
-                else:
-                    price_pos = "价格贴近 POC，震荡整理"
-            else:
-                poc_dist = 0
-                price_pos = "数据不足"
-            
-            # === 信号汇总 ===
-            bullish_count = sum(1 for s in self.signals if s.get("bias") == "bullish")
-            bearish_count = sum(1 for s in self.signals if s.get("bias") == "bearish")
-            
-            signal_names = {
-                "stacked_imbalance": "堆叠失衡",
-                "absorption": "吸收",
-                "exhaustion": "衰竭",
-                "iceberg": "冰山单",
-                "speed_of_tape": "成交速度",
-            }
-            
-            active_signals = []
-            for s in self.signals:
-                name = signal_names.get(s.get("source", ""), s.get("source", "?"))
-                bias = "看多" if s.get("bias") == "bullish" else "看空" if s.get("bias") == "bearish" else "中性"
-                active_signals.append(f"{name}({bias})")
-            
-            # === 成交速度 ===
-            if momentum == "accelerating_buy":
-                speed_desc = "买方加速入场"
-            elif momentum == "accelerating_sell":
-                speed_desc = "卖方加速入场"
-            elif momentum == "decelerating":
-                speed_desc = "动能衰减"
-            else:
-                speed_desc = "速度平稳"
-            
-            # === 交易建议 ===
-            if consensus == "bullish" and confidence > 60 and bullish_count >= 2:
-                direction = "做多"
-                direction_en = "LONG"
-                entry = price
-                sl = price * 0.9935
-                tp = price * 1.013
-                reason = f"多方信号 {bullish_count} 个一致，CVD {cvd_trend}，{speed_desc}"
-            elif consensus == "bearish" and confidence > 60 and bearish_count >= 2:
-                direction = "做空"
-                direction_en = "SHORT"
-                entry = price
-                sl = price * 1.0065
-                tp = price * 0.987
-                reason = f"空方信号 {bearish_count} 个一致，CVD {cvd_trend}，{speed_desc}"
-            else:
-                direction = "观望"
-                direction_en = "WAIT"
-                entry = sl = tp = 0
-                reason = f"信号不够一致（多{bullish_count}/空{bearish_count}），等待明确方向"
-            
-            # === 综合评分 ===
-            score = 50  # 中性基准
-            if cvd > 1000: score += 10
-            elif cvd < -1000: score -= 10
-            if poc_dist > 0.3: score += 8
-            elif poc_dist < -0.3: score -= 8
-            if bullish_count > bearish_count: score += min(bullish_count * 8, 20)
-            elif bearish_count > bullish_count: score -= min(bearish_count * 8, 20)
-            if "accelerating_buy" in str(momentum): score += 7
-            elif "accelerating_sell" in str(momentum): score -= 7
-            score = max(0, min(100, score))
-            
-            if score >= 70:
-                outlook = "偏多"
-            elif score >= 55:
-                outlook = "略偏多"
-            elif score <= 30:
-                outlook = "偏空"
-            elif score <= 45:
-                outlook = "略偏空"
-            else:
-                outlook = "中性震荡"
-            
-            report = {
-                "timestamp": now,
-                "time_str": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                "price": price,
-                "score": score,
-                "outlook": outlook,
-                "trend": {
-                    "cvd": cvd,
-                    "cvd_desc": cvd_trend,
-                    "delta": delta,
-                    "price_pos": price_pos,
-                    "speed": speed_desc,
-                    "momentum": momentum,
-                },
-                "levels": {
-                    "poc": poc,
-                    "vah": vah,
-                    "val": val,
-                    "poc_dist_pct": round(poc_dist, 3),
-                },
-                "signals": {
-                    "active": active_signals,
-                    "bullish": bullish_count,
-                    "bearish": bearish_count,
-                    "consensus": consensus,
-                    "confidence": round(confidence * 100),
-                },
-                "recommendation": {
-                    "direction": direction,
-                    "direction_en": direction_en,
-                    "entry": round(entry, 1),
-                    "stop_loss": round(sl, 1),
-                    "take_profit": round(tp, 1),
-                    "reason": reason,
-                },
-            }
-            
+
+            # 计算 ATR
+            prices = [float(t["p"]) for t in trades[-200:]]
+            atr_pct = 0.0
+            if len(prices) > 14:
+                trs = []
+                for i in range(1, len(prices)):
+                    trs.append(abs(prices[i] - prices[i-1]))
+                atr = sum(trs[-14:]) / 14
+                atr_pct = atr / price * 100 if price else 0
+
+            # 用 MarketReasoning 生成推理报告
+            report = self.reasoner.analyze(
+                price=price,
+                poc=poc, vah=vah, val=val,
+                cvd=cvd, delta=delta,
+                signals=self.signals,
+                trades=trades,
+                depth_bids=self.depth.get("bids"),
+                depth_asks=self.depth.get("asks"),
+                atr_pct=atr_pct,
+            )
+
             self.analysis_report = report
             self.analysis_time = now
             return report
-            
+
         except Exception as e:
             return {"error": str(e)}
     
@@ -733,54 +629,48 @@ body { background: #0a0a0f; color: #e0e0e0; font-family: 'SF Mono', 'Fira Code',
     </div>
   </div>
 
-  <!-- 底部: 走势分析（全宽，每 2 分钟更新）-->
+  <!-- 底部: 交易员分析（全宽，每 2 分钟更新）-->
   <div class="card" style="grid-column: 1 / -1;">
-    <div class="card-title">🧠 走势分析 <span id="analysisTime" style="float:right;color:#555;">--</span></div>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
-      <!-- 左: 综合评分 + 方向 -->
+    <div class="card-title">🧠 交易员分析 <span id="analysisTime" style="float:right;color:#555;">--</span></div>
+    <div style="display:grid;grid-template-columns:280px 1fr 280px;gap:16px;">
+      <!-- 左: 结论 + 行动方案 -->
       <div>
-        <div style="text-align:center;margin-bottom:12px;">
-          <div style="font-size:14px;color:#888;margin-bottom:4px;">综合评分</div>
-          <div id="analysisScore" style="font-size:48px;font-weight:bold;color:#ffa502;">--</div>
-          <div id="analysisOutlook" style="font-size:16px;margin-top:4px;">--</div>
+        <div id="verdictBox" style="text-align:center;padding:16px;border-radius:8px;background:rgba(255,165,2,0.1);border:1px solid #ffa502;margin-bottom:12px;">
+          <div style="font-size:11px;color:#888;">结论</div>
+          <div id="verdictText" style="font-size:28px;font-weight:bold;margin:6px 0;">--</div>
+          <div id="verdictConf" style="font-size:14px;color:#aaa;">置信度 --%</div>
+          <div id="verdictReason" style="font-size:11px;color:#888;margin-top:8px;text-align:left;">--</div>
         </div>
-        <div id="analysisRecommendation" style="text-align:center;padding:12px;border-radius:8px;background:rgba(255,165,2,0.1);border:1px solid #ffa502;">
-          <div style="font-size:11px;color:#888;">交易建议</div>
-          <div id="recDirection" style="font-size:22px;font-weight:bold;margin:4px 0;">--</div>
-          <div id="recReason" style="font-size:11px;color:#aaa;">--</div>
-        </div>
-        <div id="recLevels" style="margin-top:8px;font-size:12px;">
-          <div class="metric"><span class="metric-label">入场</span><span class="metric-value" id="recEntry">--</span></div>
-          <div class="metric"><span class="metric-label">止损</span><span class="metric-value negative" id="recSL">--</span></div>
-          <div class="metric"><span class="metric-label">止盈</span><span class="metric-value positive" id="recTP">--</span></div>
+        <div id="actionPlan" style="font-size:12px;">
+          <div style="font-size:12px;font-weight:bold;color:#888;margin-bottom:6px;">📋 行动方案</div>
+          <div id="actionEntry" class="metric"><span class="metric-label">入场</span><span class="metric-value" id="aEntry">--</span></div>
+          <div id="actionSL" class="metric"><span class="metric-label">止损</span><span class="metric-value negative" id="aSL">--</span></div>
+          <div id="actionTP" class="metric"><span class="metric-label">止盈</span><span class="metric-value positive" id="aTP">--</span></div>
+          <div id="actionRR" class="metric"><span class="metric-label">盈亏比</span><span class="metric-value" id="aRR">--</span></div>
+          <div id="actionAdvice" style="margin-top:6px;padding:6px;background:#0d0d14;border-radius:4px;font-size:11px;color:#888;">--</div>
         </div>
       </div>
-      <!-- 中: 趋势分析 -->
+      <!-- 中: 推理过程 -->
       <div>
-        <div style="font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">📊 趋势判断</div>
-        <div class="metric"><span class="metric-label">CVD 方向</span><span class="metric-value" id="aCvdDesc">--</span></div>
-        <div class="metric"><span class="metric-label">Delta</span><span class="metric-value" id="aDelta">--</span></div>
-        <div class="metric"><span class="metric-label">价格位置</span><span class="metric-value" id="aPricePos" style="font-size:11px;">--</span></div>
-        <div class="metric"><span class="metric-label">成交动能</span><span class="metric-value" id="aSpeed">--</span></div>
-        <div style="margin-top:12px;font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">📍 关键价位</div>
+        <div style="font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">💭 推理过程</div>
+        <div id="reasoningSteps" style="font-size:12px;line-height:1.8;min-height:120px;">等待数据...</div>
+        <div id="watchFor" style="margin-top:12px;padding:8px;background:#0d0d14;border-radius:4px;font-size:11px;color:#888;display:none;">
+          <div style="font-weight:bold;color:#aaa;margin-bottom:4px;">👀 观望时关注：</div>
+          <div id="watchForList"></div>
+        </div>
+      </div>
+      <!-- 右: 多空力量 + 关键价位 -->
+      <div>
+        <div style="font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">⚖️ 多空力量</div>
+        <div id="factorsBull" style="font-size:11px;margin-bottom:8px;"></div>
+        <div id="factorsBear" style="font-size:11px;margin-bottom:12px;"></div>
+        <div style="font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">📍 关键价位</div>
         <div class="metric"><span class="metric-label">POC</span><span class="metric-value" id="aPoc">--</span></div>
         <div class="metric"><span class="metric-label">VAH</span><span class="metric-value" id="aVah">--</span></div>
         <div class="metric"><span class="metric-label">VAL</span><span class="metric-value" id="aVal">--</span></div>
-        <div class="metric"><span class="metric-label">价格 vs POC</span><span class="metric-value" id="aPocDist">--</span></div>
-      </div>
-      <!-- 右: 信号详情 -->
-      <div>
-        <div style="font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">🎯 活跃信号</div>
-        <div id="aSignalList" style="min-height:60px;font-size:12px;">等待数据...</div>
-        <div style="margin-top:12px;">
-          <div class="metric"><span class="metric-label">多方信号</span><span class="metric-value positive" id="aBullCount">0</span></div>
-          <div class="metric"><span class="metric-label">空方信号</span><span class="metric-value negative" id="aBearCount">0</span></div>
-          <div class="metric"><span class="metric-label">共识</span><span class="metric-value" id="aConsensus">--</span></div>
-          <div class="metric"><span class="metric-label">置信度</span><span class="metric-value" id="aConfidence">--</span></div>
-        </div>
-        <div style="margin-top:12px;padding:8px;background:#0d0d14;border-radius:4px;font-size:11px;color:#666;">
-          ⏱ 每 2 分钟自动更新分析<br>
-          📊 基于订单流引擎 9 个模块综合判断
+        <div id="riskNote" style="margin-top:12px;padding:8px;background:rgba(255,71,87,0.08);border-radius:4px;font-size:11px;color:#ff4757;display:none;">
+          <div style="font-weight:bold;margin-bottom:4px;">⚠️ 风险提示</div>
+          <div id="riskNoteText"></div>
         </div>
       </div>
     </div>
@@ -1165,79 +1055,96 @@ function fmtPrice(n) { return n ? '$' + Number(n).toLocaleString(undefined, {max
 
 function updateAnalysis(d) {
   if (!d || d.error) return;
-  
+
   // 时间
   document.getElementById('analysisTime').textContent = d.time_str || '--';
-  
-  // 评分
-  const scoreEl = document.getElementById('analysisScore');
-  scoreEl.textContent = d.score;
-  scoreEl.style.color = d.score >= 55 ? '#00d4aa' : d.score <= 45 ? '#ff4757' : '#ffa502';
-  document.getElementById('analysisOutlook').textContent = d.outlook;
-  document.getElementById('analysisOutlook').style.color = scoreEl.style.color;
-  
-  // 建议
-  const recBox = document.getElementById('analysisRecommendation');
-  const recDir = document.getElementById('recDirection');
-  recDir.textContent = d.recommendation.direction;
-  recDir.style.color = d.recommendation.direction_en === 'LONG' ? '#00d4aa' : d.recommendation.direction_en === 'SHORT' ? '#ff4757' : '#ffa502';
-  recBox.style.borderColor = recDir.style.color;
-  recBox.style.background = d.recommendation.direction_en === 'LONG' ? 'rgba(0,212,170,0.1)' : d.recommendation.direction_en === 'SHORT' ? 'rgba(255,71,87,0.1)' : 'rgba(255,165,2,0.1)';
-  document.getElementById('recReason').textContent = d.recommendation.reason;
-  
-  // 入场/止损/止盈
-  if (d.recommendation.direction_en !== 'WAIT') {
-    document.getElementById('recEntry').textContent = fmtPrice(d.recommendation.entry);
-    document.getElementById('recSL').textContent = fmtPrice(d.recommendation.stop_loss);
-    document.getElementById('recTP').textContent = fmtPrice(d.recommendation.take_profit);
-    document.getElementById('recLevels').style.display = 'block';
+
+  // === 结论 ===
+  const verdictColors = {LONG:'#00d4aa', SHORT:'#ff4757', WAIT:'#ffa502', AVOID:'#ff4757'};
+  const verdictBox = document.getElementById('verdictBox');
+  const vColor = verdictColors[d.verdict] || '#ffa502';
+  verdictBox.style.borderColor = vColor;
+  verdictBox.style.background = vColor.replace(')', ',0.1)').replace('rgb', 'rgba').replace('#', '');
+  // 直接用 rgba
+  if (d.verdict === 'LONG') verdictBox.style.background = 'rgba(0,212,170,0.1)';
+  else if (d.verdict === 'SHORT') verdictBox.style.background = 'rgba(255,71,87,0.1)';
+  else verdictBox.style.background = 'rgba(255,165,2,0.1)';
+
+  document.getElementById('verdictText').textContent = d.verdict_zh || '--';
+  document.getElementById('verdictText').style.color = vColor;
+  document.getElementById('verdictConf').textContent = '置信度 ' + (d.confidence || 0) + '%';
+  document.getElementById('verdictReason').textContent = d.verdict_reason || '';
+
+  // === 行动方案 ===
+  const ap = d.action_plan || {};
+  if (d.verdict === 'WAIT' || d.verdict === 'AVOID') {
+    document.getElementById('actionEntry').style.display = 'none';
+    document.getElementById('actionSL').style.display = 'none';
+    document.getElementById('actionTP').style.display = 'none';
+    document.getElementById('actionRR').style.display = 'none';
+    document.getElementById('actionAdvice').textContent = ap.reason || '等待更好的机会';
   } else {
-    document.getElementById('recLevels').style.display = 'none';
+    document.getElementById('actionEntry').style.display = '';
+    document.getElementById('actionSL').style.display = '';
+    document.getElementById('actionTP').style.display = '';
+    document.getElementById('actionRR').style.display = '';
+    document.getElementById('aEntry').textContent = fmtPrice(ap.entry);
+    document.getElementById('aSL').textContent = fmtPrice(ap.stop_loss);
+    document.getElementById('aTP').textContent = fmtPrice(ap.take_profit);
+    document.getElementById('aRR').textContent = (ap.risk_reward || 0) + 'R';
+    document.getElementById('actionAdvice').textContent = ap.position_advice || '';
   }
-  
-  // 趋势
-  const t = d.trend;
-  const cvdEl = document.getElementById('aCvdDesc');
-  cvdEl.textContent = t.cvd_desc;
-  cvdEl.className = 'metric-value ' + (t.cvd > 0 ? 'positive' : t.cvd < 0 ? 'negative' : 'neutral');
-  
-  const deltaEl = document.getElementById('aDelta');
-  deltaEl.textContent = (t.delta >= 0 ? '+' : '') + t.delta.toFixed(1);
-  deltaEl.className = 'metric-value ' + (t.delta >= 0 ? 'positive' : 'negative');
-  
-  document.getElementById('aPricePos').textContent = t.price_pos;
-  document.getElementById('aSpeed').textContent = t.speed;
-  
-  // 关键价位
-  const lv = d.levels;
+
+  // 观望时关注
+  const watchFor = ap.watch_for || [];
+  const watchBox = document.getElementById('watchFor');
+  if (watchFor.length > 0 && (d.verdict === 'WAIT' || d.verdict === 'AVOID')) {
+    watchBox.style.display = 'block';
+    document.getElementById('watchForList').innerHTML = watchFor.map(w => '• ' + w).join('<br>');
+  } else {
+    watchBox.style.display = 'none';
+  }
+
+  // === 推理过程 ===
+  const steps = d.reasoning_steps || [];
+  let stepsHtml = '';
+  steps.forEach(s => {
+    if (s && s.thought) {
+      stepsHtml += '<div style="padding:6px 0;border-bottom:1px solid #1a1a2e;line-height:1.6;">' + s.thought + '</div>';
+    }
+  });
+  document.getElementById('reasoningSteps').innerHTML = stepsHtml || '<div style="color:#666">等待数据...</div>';
+
+  // === 多空力量 ===
+  let bullHtml = '<div style="color:#00d4aa;font-weight:bold;margin-bottom:4px;">多方因素</div>';
+  (d.factors_bull || []).forEach(f => {
+    bullHtml += '<div style="padding:2px 0;">🟢 ' + f[0] + ' <span style="color:#666">(权重' + f[1] + ')</span></div>';
+  });
+  if (!d.factors_bull || d.factors_bull.length === 0) bullHtml += '<div style="color:#666">无</div>';
+  document.getElementById('factorsBull').innerHTML = bullHtml;
+
+  let bearHtml = '<div style="color:#ff4757;font-weight:bold;margin-bottom:4px;">空方因素</div>';
+  (d.factors_bear || []).forEach(f => {
+    bearHtml += '<div style="padding:2px 0;">🔴 ' + f[0] + ' <span style="color:#666">(权重' + f[1] + ')</span></div>';
+  });
+  if (!d.factors_bear || d.factors_bear.length === 0) bearHtml += '<div style="color:#666">无</div>';
+  document.getElementById('factorsBear').innerHTML = bearHtml;
+
+  // === 关键价位 ===
+  const lv = d.levels || {};
   document.getElementById('aPoc').textContent = fmtPrice(lv.poc);
   document.getElementById('aVah').textContent = fmtPrice(lv.vah);
   document.getElementById('aVal').textContent = fmtPrice(lv.val);
-  const pocDistEl = document.getElementById('aPocDist');
-  pocDistEl.textContent = (lv.poc_dist_pct >= 0 ? '+' : '') + lv.poc_dist_pct.toFixed(3) + '%';
-  pocDistEl.className = 'metric-value ' + (lv.poc_dist_pct > 0 ? 'positive' : lv.poc_dist_pct < 0 ? 'negative' : 'neutral');
-  
-  // 信号
-  const sig = d.signals;
-  let sigHtml = '';
-  (sig.active || []).forEach(s => {
-    const isBull = s.includes('看多');
-    const isBear = s.includes('看空');
-    const cls = isBull ? 'signal-bullish' : isBear ? 'signal-bearish' : 'signal-neutral';
-    const icon = isBull ? '🟢' : isBear ? '🔴' : '⚪';
-    sigHtml += '<div class="signal-item ' + cls + '">' + icon + ' ' + s + '</div>';
-  });
-  document.getElementById('aSignalList').innerHTML = sigHtml || '<div style="color:#666">暂无活跃信号</div>';
-  
-  document.getElementById('aBullCount').textContent = sig.bullish;
-  document.getElementById('aBearCount').textContent = sig.bearish;
-  
-  const consEl = document.getElementById('aConsensus');
-  const consMap = {bullish:'🟢 做多', bearish:'🔴 做空', neutral:'⚪ 观望'};
-  consEl.textContent = consMap[sig.consensus] || sig.consensus;
-  consEl.className = 'metric-value ' + (sig.consensus === 'bullish' ? 'positive' : sig.consensus === 'bearish' ? 'negative' : 'neutral');
-  
-  document.getElementById('aConfidence').textContent = sig.confidence + '%';
+
+  // === 风险提示 ===
+  const riskNote = d.risk_note || '';
+  const riskBox = document.getElementById('riskNote');
+  if (riskNote && riskNote.length > 10) {
+    riskBox.style.display = 'block';
+    document.getElementById('riskNoteText').textContent = riskNote.replace(/^【风险】/, '');
+  } else {
+    riskBox.style.display = 'none';
+  }
 }
 
 // 首次加载 + 每 2 分钟刷新（失败时 10 秒重试）
