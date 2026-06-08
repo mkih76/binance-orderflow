@@ -174,8 +174,8 @@ class DashboardData:
                 atr = sum(trs[-14:]) / 14
                 atr_pct = atr / price * 100 if price else 0
 
-            # 用 MarketReasoning 生成推理报告
-            report = self.reasoner.analyze(
+            # 用 MarketReasoning 生成推理报告（AI 优先，规则兜底）
+            report = self.reasoner.analyze_with_ai(
                 price=price,
                 poc=poc, vah=vah, val=val,
                 cvd=cvd, delta=delta,

@@ -2377,6 +2377,172 @@ class MarketReasoning:
 
         return report
 
+    def analyze_with_ai(self, price, poc, vah, val, cvd, delta, signals, trades,
+                        depth_bids=None, depth_asks=None, regime=None, atr_pct=None):
+        """
+        用 AI 模型进行市场分析推理
+
+        先用规则引擎收集数据，再把上下文发给 AI，让 AI 像资深交易员一样分析。
+        如果 AI 不可用，回退到规则引擎。
+        """
+        try:
+            from config import AI_BASE_URL, AI_API_KEY, AI_MODEL, AI_ENABLED, AI_MAX_TOKENS
+        except ImportError:
+            AI_ENABLED = False
+
+        if not AI_ENABLED or not AI_BASE_URL or not AI_API_KEY:
+            return self.analyze(price, poc, vah, val, cvd, delta, signals, trades,
+                                depth_bids, depth_asks, regime, atr_pct)
+
+        # 构建市场上下文
+        context = self._build_context(price, poc, vah, val, cvd, delta, signals, trades,
+                                       depth_bids, depth_asks, regime, atr_pct)
+
+        # 调用 AI
+        ai_result = self._call_ai(context, AI_BASE_URL, AI_API_KEY, AI_MODEL, AI_MAX_TOKENS)
+
+        if ai_result:
+            # AI 分析成功，合并规则引擎的基础数据
+            rule_report = self.analyze(price, poc, vah, val, cvd, delta, signals, trades,
+                                       depth_bids, depth_asks, regime, atr_pct)
+            rule_report["ai_analysis"] = ai_result
+            rule_report["reasoning_steps"] = [
+                {"thought": ai_result.get("analysis", "")},
+            ]
+            if ai_result.get("verdict"):
+                rule_report["verdict"] = ai_result["verdict"]
+                rule_report["verdict_zh"] = {"LONG": "做多", "SHORT": "做空", "WAIT": "观望", "AVOID": "回避"}.get(ai_result["verdict"], "观望")
+            if ai_result.get("confidence"):
+                rule_report["confidence"] = ai_result["confidence"]
+            if ai_result.get("verdict_reason"):
+                rule_report["verdict_reason"] = ai_result["verdict_reason"]
+            if ai_result.get("action_plan"):
+                rule_report["action_plan"].update(ai_result["action_plan"])
+            return rule_report
+        else:
+            # AI 调用失败，回退到规则引擎
+            return self.analyze(price, poc, vah, val, cvd, delta, signals, trades,
+                                depth_bids, depth_asks, regime, atr_pct)
+
+    def _build_context(self, price, poc, vah, val, cvd, delta, signals, trades,
+                       depth_bids, depth_asks, regime, atr_pct):
+        """构建发给 AI 的市场上下文"""
+        # 价格趋势
+        recent_prices = [float(t["p"]) for t in trades[-100:]]
+        price_change = (recent_prices[-1] - recent_prices[0]) / recent_prices[0] * 100 if recent_prices else 0
+
+        # 成交量
+        recent_vols = [float(t["q"]) for t in trades[-100:]]
+        avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
+
+        # 信号摘要
+        signal_summary = []
+        for s in signals:
+            signal_summary.append(f"- {s.get('source','?')}: {s.get('bias','neutral')} ({s.get('type','')})")
+
+        # 订单簿
+        book_info = ""
+        if depth_bids and depth_asks:
+            max_bid = max(q for _, q in depth_bids) if depth_bids else 0
+            max_ask = max(q for _, q in depth_asks) if depth_asks else 0
+            bid_total = sum(q for _, q in depth_bids[:5])
+            ask_total = sum(q for _, q in depth_asks[:5])
+            book_info = f"买盘前5总量: {bid_total:.2f}, 卖盘前5总量: {ask_total:.2f}, 最大买单: {max_bid:.2f}, 最大卖单: {max_ask:.2f}"
+
+        context = f"""你是一个资深加密货币交易员，正在分析 BTCUSDT 合约的订单流数据。
+
+## 当前市场数据
+- 当前价格: {price:.1f}
+- POC (成交量重心): {poc or 'N/A'}
+- VAH (价值区上沿): {vah or 'N/A'}
+- VAL (价值区下沿): {val or 'N/A'}
+- CVD (累积成交量差): {cvd:+.0f}
+- Delta (当前K线): {delta:+.0f}
+- ATR 波动率: {atr_pct:.2f}% (如果有的话)
+- 市场状态: {regime.get('regime', 'unknown') if regime else 'unknown'}
+
+## 价格动态
+- 最近100笔价格变化: {price_change:+.2f}%
+- 平均成交量: {avg_vol:.4f} BTC
+
+## 订单流信号
+{chr(10).join(signal_summary) if signal_summary else '无明显信号'}
+
+## 订单簿深度
+{book_info or '无数据'}
+
+请像一个有10年经验的交易员一样分析这个市场。你的分析需要：
+1. 读懂当前市场结构（趋势、位置、关键价位的含义）
+2. 评估订单流质量（CVD是否确认价格走势？有没有背离？）
+3. 判断是否有有效的交易setup
+4. 给出明确的行动建议
+
+请用以下JSON格式回复：
+{{
+  "analysis": "你的详细分析（2-4句话，用交易员的语言，不要说废话）",
+  "verdict": "LONG 或 SHORT 或 WAIT 或 AVOID",
+  "confidence": 0到100的数字,
+  "verdict_reason": "一句话总结为什么这么判断",
+  "action_plan": {{
+    "entry": 入场价格数字,
+    "stop_loss": 止损价格数字,
+    "take_profit": 止盈价格数字,
+    "position_advice": "仓位建议"
+  }}
+}}
+
+只返回JSON，不要其他内容。"""
+        return context
+
+    def _call_ai(self, context, base_url, api_key, model, max_tokens=1000):
+        """调用 AI API（OpenAI 兼容格式）"""
+        import json as _json
+        try:
+            import requests
+            url = f"{base_url.rstrip('/')}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "你是一个资深加密货币交易员，专注于订单流分析。只返回JSON，不要markdown代码块。"},
+                    {"role": "user", "content": context},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.3,
+            }
+
+            proxies = None
+            try:
+                from config import PROXY_ENABLED, SOCKS5_PROXY
+                if PROXY_ENABLED and SOCKS5_PROXY:
+                    proxies = {"http": SOCKS5_PROXY, "https": SOCKS5_PROXY}
+            except ImportError:
+                pass
+
+            resp = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=30)
+            if resp.status_code != 200:
+                print(f"⚠️ AI API 错误 [{resp.status_code}]: {resp.text[:200]}")
+                return None
+
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"].strip()
+
+            # 解析 JSON（处理可能的 markdown 代码块）
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+
+            return _json.loads(content)
+
+        except Exception as e:
+            print(f"⚠️ AI 调用失败: {e}")
+            return None
+
     def _read_structure(self, price, poc, vah, val, cvd, delta, trades):
         """第一步：读懂市场结构"""
         if not poc:

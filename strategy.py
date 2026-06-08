@@ -31,7 +31,8 @@ from orderflow import (
 from trader import (
     place_order, get_positions, get_balance,
     get_price, api_request, get_base_url, get_current_mode,
-    place_stop_order, place_take_profit_order, cancel_all_orders
+    place_stop_order, place_take_profit_order, cancel_all_orders,
+    is_position_active
 )
 
 # ==================== 策略参数 ====================
@@ -436,6 +437,41 @@ def run_strategy(dry_run=False):
                 tp = pos["take_profit"]
                 direction = pos["direction"]
                 hold_time = (time.time() - pos["entry_time"]) / 60
+
+                # --- OCO 检查：服务端止损/止盈单是否已触发 ---
+                # 如果持仓已被服务端单平掉，取消另一个挂单，更新状态
+                if not dry_run and not is_position_active(cfg["symbol"]):
+                    # 持仓已消失，说明服务端 SL 或 TP 已触发
+                    cancel_all_orders(cfg["symbol"])  # 撤掉另一个挂单
+                    # 估算 PnL（用当前价近似）
+                    pnl = (current_price - entry) if direction == "long" else (entry - current_price)
+                    pnl_pct = pnl / entry * 100
+                    pnl_usdt = pnl * pos["qty"]
+                    # 判断是止损还是止盈触发的
+                    if (direction == "long" and current_price <= sl) or \
+                       (direction == "short" and current_price >= sl):
+                        exit_reason = "stop_loss"
+                        icon = "🔴"
+                        state["consecutive_losses"] += 1
+                    elif (direction == "long" and current_price >= tp) or \
+                         (direction == "short" and current_price <= tp):
+                        exit_reason = "take_profit"
+                        icon = "🟢"
+                        state["consecutive_losses"] = 0
+                        state["total_wins"] += 1
+                    else:
+                        # 价格在 SL 和 TP 之间，可能是服务端用标记价触发的
+                        exit_reason = "server_triggered"
+                        icon = "⚡"
+                    print(f"  {icon} 服务端{exit_reason}已触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)")
+                    trade_id = pos.get("trade_id", f"T{state['total_trades']}")
+                    if journal:
+                        journal.log_exit(trade_id, current_price, exit_reason, pnl, pnl_pct, hold_time)
+                    state["daily_pnl"] += pnl_usdt
+                    state["open_position"] = None
+                    state["daily_trades"] += 1
+                    save_state(state)
+                    continue
 
                 # 止损
                 if (direction == "long" and current_price <= sl) or \

@@ -425,7 +425,7 @@ def get_positions():
     if not mode.startswith("futures"):
         print("⚠️ 持仓查询仅支持合约模式，请先切换: python trader.py mode futures_demo")
         return None
-    
+
     base = get_base_url(mode)
     url = f"{base}/fapi/v2/positionRisk"
     data = api_request("GET", url, signed=True, mode=mode)
@@ -443,6 +443,25 @@ def get_positions():
             print(f"  {p['symbol']}: {side} {abs(amt)} @ {entry}, 浮盈: {pnl:+.4f} USDT")
         return data
     return None
+
+def is_position_active(symbol="BTCUSDT"):
+    """
+    轻量级检查指定交易对是否有活跃持仓
+
+    Returns:
+        True if position exists with non-zero amount, False otherwise
+    """
+    mode = get_current_mode()
+    if not mode.startswith("futures"):
+        return False
+    base = get_base_url(mode)
+    url = f"{base}/fapi/v2/positionRisk"
+    data = api_request("GET", url, signed=True, mode=mode)
+    if data:
+        for p in data:
+            if p.get("symbol") == symbol and float(p.get("positionAmt", 0)) != 0:
+                return True
+    return False
 
 def get_klines(symbol, interval="1h", limit=10):
     """获取 K 线数据"""
