@@ -26,6 +26,7 @@ from orderflow import (
     MarketRegimeDetector, ATRCalculator, BookImbalance,
     MultiTimeframeConfirm, OIFundingAnalyzer, AdaptiveParams,
     DynamicPositionSizer, TradeJournal, EnhancedSignalEngine,
+    auto_tick_size,
 )
 from trader import (
     place_order, get_positions, get_balance,
@@ -309,37 +310,43 @@ def generate_signals(engine, trades, cfg, enhanced_result=None):
 # ==================== 风控检查 ====================
 
 def risk_check(state, cfg):
-    """风控检查"""
+    """
+    风控检查
+
+    daily_pnl 存储的是绝对金额（USDT），不是百分比。
+    每笔交易的盈亏 = pnl_pct / 100 * account_balance
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    
+
     # 重置每日计数
     if state["last_trade_date"] != today:
         state["daily_trades"] = 0
         state["daily_pnl"] = 0.0
         state["last_trade_date"] = today
-    
+
     # 检查交易次数
     if state["daily_trades"] >= cfg["max_daily_trades"]:
         return False, "已达今日最大交易次数"
-    
-    # 检查日亏损
-    if state["daily_pnl"] <= -cfg["max_daily_loss"] * 100:
-        return False, f"已达今日最大亏损 {cfg['max_daily_loss']*100:.0f}%"
-    
+
+    # 检查日亏损（基于账户余额的绝对金额）
+    max_loss_amount = cfg["account_balance"] * cfg["max_daily_loss"]
+    if state["daily_pnl"] <= -max_loss_amount:
+        return False, f"已达今日最大亏损 {max_loss_amount:.1f} USDT ({cfg['max_daily_loss']*100:.0f}%)"
+
     # 检查连亏
     if state["consecutive_losses"] >= cfg["max_consecutive_loss"]:
         return False, f"连续亏损 {state['consecutive_losses']} 次，停手"
-    
+
     # 检查交易时段
     utc_hour = datetime.now(timezone.utc).hour
     start_h, end_h = cfg["active_hours"]
     if not (start_h <= utc_hour < end_h):
         return False, f"不在交易时段 ({start_h}:00-{end_h}:00 UTC)"
-    
+
     # 检查是否已有持仓
     if state.get("open_position"):
         return False, "已有持仓"
-    
+
     return True, "OK"
 
 # ==================== 策略主循环 ====================
@@ -350,11 +357,19 @@ def run_strategy(dry_run=False):
     state = load_state()
 
     # 初始化引擎
+    # 获取初始价格以自动选择 tick_size
+    init_price = get_price(cfg["symbol"])
+    if init_price:
+        tick = auto_tick_size(init_price)
+    else:
+        tick = cfg["tick_size"]
+    print(f"  tick_size: {tick} (基于价格 {init_price or 'N/A'})")
+
     if cfg.get("use_enhanced_engine"):
-        engine = EnhancedSignalEngine(tick_size=cfg["tick_size"])
+        engine = EnhancedSignalEngine(tick_size=tick)
         print(f"{'🧪 干跑模式' if dry_run else '🚀 实盘模式'} (增强版引擎)")
     else:
-        engine = OrderFlowSignalEngine(tick_size=cfg["tick_size"])
+        engine = OrderFlowSignalEngine(tick_size=tick)
         print(f"{'🧪 干跑模式' if dry_run else '🚀 实盘模式'} (基础引擎)")
 
     # 初始化交易日志
@@ -427,7 +442,8 @@ def run_strategy(dry_run=False):
                    (direction == "short" and current_price >= sl):
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
                     pnl_pct = pnl / entry * 100
-                    print(f"  🔴 止损触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}%")
+                    pnl_usdt = pnl * pos["qty"]  # 实际盈亏金额
+                    print(f"  🔴 止损触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)")
 
                     if journal:
                         trade_id = pos.get("trade_id", f"T{state['total_trades']}")
@@ -438,7 +454,7 @@ def run_strategy(dry_run=False):
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
 
-                    state["daily_pnl"] += pnl_pct
+                    state["daily_pnl"] += pnl_usdt  # 累加绝对金额
                     state["consecutive_losses"] += 1
                     state["open_position"] = None
                     state["daily_trades"] += 1
@@ -450,7 +466,8 @@ def run_strategy(dry_run=False):
                    (direction == "short" and current_price <= tp):
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
                     pnl_pct = pnl / entry * 100
-                    print(f"  🟢 止盈触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}%")
+                    pnl_usdt = pnl * pos["qty"]
+                    print(f"  🟢 止盈触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)")
 
                     if journal:
                         trade_id = pos.get("trade_id", f"T{state['total_trades']}")
@@ -461,7 +478,7 @@ def run_strategy(dry_run=False):
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
 
-                    state["daily_pnl"] += pnl_pct
+                    state["daily_pnl"] += pnl_usdt
                     state["consecutive_losses"] = 0
                     state["open_position"] = None
                     state["daily_trades"] += 1
@@ -473,7 +490,8 @@ def run_strategy(dry_run=False):
                 if hold_time > cfg["max_hold_minutes"]:
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
                     pnl_pct = pnl / entry * 100
-                    print(f"  ⏰ 超时平仓! 持仓 {hold_time:.0f} 分钟, PnL={pnl_pct:+.2f}%")
+                    pnl_usdt = pnl * pos["qty"]
+                    print(f"  ⏰ 超时平仓! 持仓 {hold_time:.0f} 分钟, PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)")
 
                     if journal:
                         trade_id = pos.get("trade_id", f"T{state['total_trades']}")
@@ -484,20 +502,25 @@ def run_strategy(dry_run=False):
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
 
-                    state["daily_pnl"] += pnl_pct
+                    state["daily_pnl"] += pnl_usdt
                     state["open_position"] = None
                     state["daily_trades"] += 1
                     save_state(state)
                     continue
 
-                # 移动止损
+                # 追踪止损（每次价格创新高/新低都跟随上移）
                 if cfg["trailing_stop_1r"]:
                     risk = abs(entry - sl)
+                    # 盈利达到 1R 后启动追踪
                     if direction == "long" and current_price >= entry + risk:
-                        new_sl = entry + risk * 0.5
+                        # 追踪止损 = 当前价格 - 0.5R，且只能上移不能下移
+                        new_sl = current_price - risk * 0.5
                         if new_sl > sl:
                             state["open_position"]["stop_loss"] = new_sl
-                            print(f"  📍 移动止损到 {new_sl:.1f}")
+                            # 记录最高价用于追踪
+                            state["open_position"]["trail_high"] = max(
+                                state["open_position"].get("trail_high", entry), current_price)
+                            print(f"  📍 追踪止损到 {new_sl:.1f} (最高价 {current_price:.1f})")
                             if not dry_run:
                                 cancel_all_orders(cfg["symbol"])
                                 close_side = "SELL" if direction == "long" else "BUY"
@@ -506,10 +529,12 @@ def run_strategy(dry_run=False):
                                     state["open_position"]["sl_order_id"] = sl_order.get("orderId")
                             save_state(state)
                     elif direction == "short" and current_price <= entry - risk:
-                        new_sl = entry - risk * 0.5
+                        new_sl = current_price + risk * 0.5
                         if new_sl < sl:
                             state["open_position"]["stop_loss"] = new_sl
-                            print(f"  📍 移动止损到 {new_sl:.1f}")
+                            state["open_position"]["trail_low"] = min(
+                                state["open_position"].get("trail_low", entry), current_price)
+                            print(f"  📍 追踪止损到 {new_sl:.1f} (最低价 {current_price:.1f})")
                             if not dry_run:
                                 cancel_all_orders(cfg["symbol"])
                                 close_side = "SELL" if direction == "long" else "BUY"

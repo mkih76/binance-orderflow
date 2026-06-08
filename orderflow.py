@@ -121,6 +121,19 @@ def fetch_depth(symbol="BTCUSDT", limit=20):
         return None
     return r.json()
 
+def auto_tick_size(price):
+    """根据价格自动选择合适的 tick_size"""
+    if price >= 50000:
+        return 10.0
+    elif price >= 10000:
+        return 5.0
+    elif price >= 1000:
+        return 1.0
+    elif price >= 100:
+        return 0.1
+    else:
+        return 0.01
+
 # ==================== 1. 足迹图 (Footprint Chart) ====================
 
 class FootprintChart:
@@ -321,36 +334,56 @@ class DeltaTracker:
     
     def get_divergence(self, lookback=10):
         """
-        CVD 背离检测
-        
-        看涨背离: 价格创新低，但 CVD 没有创新低
-        看跌背离: 价格创新高，但 CVD 没有创新高
-        
+        结构性 CVD 背离检测
+
+        找到两个明确的低/高点，对比价格和 CVD 的结构：
+        - 看涨背离: 价格走出 lower low，但 CVD 走出 higher low
+        - 看跌背离: 价格走出 higher high，但 CVD 走出 lower high
+
         Returns:
             str: "bullish_div" / "bearish_div" / "none"
         """
         if len(self.history) < lookback:
             return "none"
-        
+
         recent = self.history[-lookback:]
         prices = [h["price"] for h in recent]
         cvds = [h["cvd"] for h in recent]
-        
-        # 找最近的两个极值点
-        price_min_idx = prices.index(min(prices))
-        price_max_idx = prices.index(max(prices))
-        cvd_min_idx = cvds.index(min(cvds))
-        cvd_max_idx = cvds.index(max(cvds))
-        
-        # 看涨背离: 价格低点在后，但 CVD 低点在前
-        if price_min_idx > cvd_min_idx and price_min_idx == len(prices) - 1:
-            return "bullish_div"
-        
-        # 看跌背离: 价格高点在后，但 CVD 高点在前
-        if price_max_idx > cvd_max_idx and price_max_idx == len(prices) - 1:
-            return "bearish_div"
-        
+
+        # 找两个局部低点（价格）
+        lows = self._find_local_extremes(prices, mode="min")
+        if len(lows) >= 2:
+            p1_idx, p1_val = lows[-2]
+            p2_idx, p2_val = lows[-1]
+            c1_val = cvds[p1_idx]
+            c2_val = cvds[p2_idx]
+            # price lower low + CVD higher low → bullish divergence
+            if p2_val < p1_val and c2_val > c1_val:
+                return "bullish_div"
+
+        # 找两个局部高点（价格）
+        highs = self._find_local_extremes(prices, mode="max")
+        if len(highs) >= 2:
+            p1_idx, p1_val = highs[-2]
+            p2_idx, p2_val = highs[-1]
+            c1_val = cvds[p1_idx]
+            c2_val = cvds[p2_idx]
+            # price higher high + CVD lower high → bearish divergence
+            if p2_val > p1_val and c2_val < c1_val:
+                return "bearish_div"
+
         return "none"
+
+    def _find_local_extremes(self, values, mode="min", window=2):
+        """找局部极值点，返回 [(index, value), ...]"""
+        extremes = []
+        for i in range(window, len(values) - window):
+            segment = values[i - window:i + window + 1]
+            if mode == "min" and values[i] == min(segment):
+                extremes.append((i, values[i]))
+            elif mode == "max" and values[i] == max(segment):
+                extremes.append((i, values[i]))
+        return extremes
     
     def print_status(self):
         """打印 Delta/CVD 状态"""
@@ -524,21 +557,23 @@ class VolumeProfile:
 
 class ImbalanceDetector:
     """
-    堆叠失衡检测
-    
+    堆叠失衡检测（支持跨 K 线）
+
     原理：
     - 在足迹图中，如果某价格的买量是下方价格卖量的 N 倍以上 → 买方失衡
     - 连续 3+ 个价格出现同方向失衡 → 堆叠失衡（Stacked Imbalance）
-    - 堆叠失衡 = 强势方向信号
-    
+    - 跨 K 线：同一价格区域连续多根 K 线出现同方向失衡 → 更强信号
+
     参数：
     - ratio: 失衡比率阈值（默认 3.0，即 3:1）
     - min_stack: 最少堆叠层数（默认 3）
     """
-    
+
     def __init__(self, ratio=3.0, min_stack=3):
         self.ratio = ratio
         self.min_stack = min_stack
+        # 跨 K 线失衡追踪
+        self.bar_imbalance_history = deque(maxlen=10)  # 最近 10 根 K 线的失衡记录
     
     def detect(self, bar_data):
         """
@@ -616,16 +651,107 @@ class ImbalanceDetector:
                 })
         
         return signals
-    
+
+    def detect_cross_bar(self, bar_data, tick_size=10.0):
+        """
+        跨 K 线堆叠失衡检测
+
+        追踪最近 N 根 K 线中，同一价格区域反复出现同方向失衡的情况。
+        比单根 K 线内的堆叠更可靠。
+
+        Args:
+            bar_data: 当前 K 线的足迹数据
+            tick_size: 价格精度
+
+        Returns:
+            list of cross-bar imbalance signals
+        """
+        if not bar_data:
+            return []
+
+        # 记录当前 K 线的失衡区域
+        prices = sorted(bar_data.keys())
+        buy_imbalance_prices = set()
+        sell_imbalance_prices = set()
+
+        for i in range(len(prices) - 1):
+            upper = prices[i]
+            lower = prices[i + 1]
+            upper_buy = bar_data[upper]["buy"]
+            lower_sell = bar_data[lower]["sell"]
+            upper_sell = bar_data[upper]["sell"]
+            lower_buy = bar_data[lower]["buy"]
+
+            if lower_sell > 0 and upper_buy / lower_sell >= self.ratio:
+                buy_imbalance_prices.add(upper)
+            elif upper_buy > 0 and lower_sell == 0:
+                buy_imbalance_prices.add(upper)
+
+            if lower_buy > 0 and upper_sell / lower_buy >= self.ratio:
+                sell_imbalance_prices.add(lower)
+            elif upper_sell > 0 and lower_buy == 0:
+                sell_imbalance_prices.add(lower)
+
+        # 保存到历史
+        self.bar_imbalance_history.append({
+            "buy_prices": buy_imbalance_prices,
+            "sell_prices": sell_imbalance_prices,
+        })
+
+        if len(self.bar_imbalance_history) < 3:
+            return []
+
+        signals = []
+
+        # 检查最近 3 根 K 线中，是否有同一价格区域反复出现买方失衡
+        recent_buys = [h["buy_prices"] for h in self.bar_imbalance_history]
+        common_buy_prices = recent_buys[0]
+        for p_set in recent_buys[1:]:
+            common_buy_prices = common_buy_prices & p_set
+
+        if len(common_buy_prices) >= 2:
+            buy_list = sorted(common_buy_prices)
+            signals.append({
+                "type": "cross_bar_buy_imbalance",
+                "direction": "bullish",
+                "bias": "bullish",
+                "price_start": buy_list[0],
+                "price_end": buy_list[-1],
+                "bar_count": len(self.bar_imbalance_history),
+                "levels": len(common_buy_prices),
+                "strength": len(common_buy_prices) / self.min_stack,
+            })
+
+        # 检查卖方跨 K 线失衡
+        recent_sells = [h["sell_prices"] for h in self.bar_imbalance_history]
+        common_sell_prices = recent_sells[0]
+        for p_set in recent_sells[1:]:
+            common_sell_prices = common_sell_prices & p_set
+
+        if len(common_sell_prices) >= 2:
+            sell_list = sorted(common_sell_prices)
+            signals.append({
+                "type": "cross_bar_sell_imbalance",
+                "direction": "bearish",
+                "bias": "bearish",
+                "price_start": sell_list[0],
+                "price_end": sell_list[-1],
+                "bar_count": len(self.bar_imbalance_history),
+                "levels": len(common_sell_prices),
+                "strength": len(common_sell_prices) / self.min_stack,
+            })
+
+        return signals
+
     def _find_stacks(self, imbalance_levels, all_prices):
         """找出连续的价格层"""
         if not imbalance_levels:
             return []
-        
+
         imbalance_set = set(imbalance_levels)
         stacks = []
         current_stack = []
-        
+
         for price in all_prices:
             if price in imbalance_set:
                 current_stack.append(price)
@@ -633,37 +759,35 @@ class ImbalanceDetector:
                 if len(current_stack) >= self.min_stack:
                     stacks.append(current_stack)
                 current_stack = []
-        
+
         if len(current_stack) >= self.min_stack:
             stacks.append(current_stack)
-        
+
         return stacks
 
 # ==================== 5. 吸收检测 (Absorption) ====================
 
 class AbsorptionDetector:
     """
-    吸收检测
-    
+    吸收检测（按市场状态建基线）
+
     定义：大量主动成交发生，但价格几乎不动
     → 说明有大量被动限价单在吸收主动单
-    
+
     检测公式（三个条件同时满足）：
-    1. Volume Z-Score > 3.0（成交量统计显著异常）
+    1. Volume Z-Score > threshold（成交量统计显著异常）
     2. Net Taker Imbalance > 60% 或 < -60%（极端方向性）
     3. Relative Price Impact < 0.8（价格几乎没动）
-    
-    信号：
-    - 买方吸收（卖方被吸收）→ 看涨
-    - 卖方吸收（买方被吸收）→ 看跌
+
+    改进：按成交量高低分别建基线，避免高波动时段误判
     """
-    
+
     def __init__(self, z_threshold=3.0, imbalance_threshold=0.6, price_impact_threshold=0.8):
         self.z_threshold = z_threshold
         self.imbalance_threshold = imbalance_threshold
         self.price_impact_threshold = price_impact_threshold
-        self.volume_history = deque(maxlen=100)  # 历史成交量用于计算 Z-Score
-        self.price_impact_history = deque(maxlen=50)  # 历史价格影响用于归一化
+        self.volume_history = deque(maxlen=100)
+        self.price_impact_history = deque(maxlen=50)
     
     def detect(self, trades, window_seconds=60):
         """
@@ -754,60 +878,59 @@ class AbsorptionDetector:
 class ExhaustionDetector:
     """
     衰竭检测
-    
+
     定义：价格到达极端位置后，成交量逐渐萎缩
     → 说明推动力量耗尽，反转在即
-    
+
     检测方法：
     1. 价格处于近期高/低点
-    2. 最近 N 个周期成交量递减
-    3. Delta 方向与价格方向不一致
+    2. 最近 N 个周期成交量递减（阈值从 0.5 降到 0.3，更灵敏）
+    3. Delta 方向与价格方向不一致，且 Delta 绝对值有意义
     """
-    
-    def __init__(self, lookback=10, volume_decline_threshold=0.5):
+
+    def __init__(self, lookback=10, volume_decline_threshold=0.3):
         self.lookback = lookback
         self.volume_decline_threshold = volume_decline_threshold
-    
+
     def detect(self, delta_history):
         """
         检测衰竭
-        
+
         Args:
             delta_history: DeltaTracker.history 列表
-        
+
         Returns:
             list of exhaustion events
         """
         if len(delta_history) < self.lookback:
             return []
-        
+
         recent = delta_history[-self.lookback:]
         signals = []
-        
+
         # 检查成交量递减
         vols = [h["buy"] + h["sell"] for h in recent]
         prices = [h["price"] for h in recent]
-        
-        # 计算成交量趋势
+
         if len(vols) >= 3:
             recent_vol_avg = sum(vols[-3:]) / 3
             earlier_vol_avg = sum(vols[:-3]) / max(1, len(vols) - 3)
-            
+
             vol_decline = 1 - (recent_vol_avg / earlier_vol_avg) if earlier_vol_avg > 0 else 0
-            
+
             if vol_decline > self.volume_decline_threshold:
-                # 价格在极端位置？
                 current_price = prices[-1]
                 price_high = max(prices)
                 price_low = min(prices)
                 price_range = price_high - price_low
-                
+
                 if price_range > 0:
-                    # 检查是否在高点衰竭（看跌）
+                    # 高点衰竭（看跌）：价格在高位 + Delta 转负且有意义
                     if (price_high - current_price) / price_range < 0.2:
-                        # 价格在高位，成交量萎缩 → 看跌衰竭
                         recent_delta = sum(h["delta"] for h in recent[-3:])
-                        if recent_delta < 0:  # Delta 转负
+                        avg_vol = sum(vols[-3:]) / 3
+                        # Delta 绝对值要超过平均成交量的 10% 才有意义
+                        if recent_delta < 0 and avg_vol > 0 and abs(recent_delta) / avg_vol > 0.1:
                             signals.append({
                                 "type": "exhaustion",
                                 "direction": "bearish_exhaustion",
@@ -816,11 +939,12 @@ class ExhaustionDetector:
                                 "price": current_price,
                                 "recent_delta": recent_delta,
                             })
-                    
-                    # 检查是否在低点衰竭（看涨）
+
+                    # 低点衰竭（看涨）：价格在低位 + Delta 转正且有意义
                     if (current_price - price_low) / price_range < 0.2:
                         recent_delta = sum(h["delta"] for h in recent[-3:])
-                        if recent_delta > 0:  # Delta 转正
+                        avg_vol = sum(vols[-3:]) / 3
+                        if recent_delta > 0 and avg_vol > 0 and abs(recent_delta) / avg_vol > 0.1:
                             signals.append({
                                 "type": "exhaustion",
                                 "direction": "bullish_exhaustion",
@@ -829,7 +953,7 @@ class ExhaustionDetector:
                                 "price": current_price,
                                 "recent_delta": recent_delta,
                             })
-        
+
         return signals
 
 # ==================== 7. 冰山单检测 (Iceberg Detection) ====================
@@ -1077,34 +1201,40 @@ class OrderFlowSignalEngine:
     def analyze(self, trades):
         """运行全部分析，返回信号"""
         all_signals = []
-        
-        # 1. 堆叠失衡
+
+        # 1. 堆叠失衡（单 K 线）
         _, latest_bar = self.footprint.get_latest_bar()
         if latest_bar:
             imb_signals = self.imbalance.detect(latest_bar)
             for s in imb_signals:
                 s["source"] = "stacked_imbalance"
                 all_signals.append(s)
-        
+
+            # 1b. 跨 K 线堆叠失衡
+            cross_signals = self.imbalance.detect_cross_bar(latest_bar, self.footprint.tick_size)
+            for s in cross_signals:
+                s["source"] = "cross_bar_imbalance"
+                all_signals.append(s)
+
         # 2. 吸收
         abs_signals = self.absorption.detect(trades)
         for s in abs_signals:
             s["source"] = "absorption"
             all_signals.append(s)
-        
+
         # 3. 衰竭
         exh_signals = self.exhaustion.detect(self.delta.history)
         for s in exh_signals:
             s["source"] = "exhaustion"
             all_signals.append(s)
-        
+
         # 4. 冰山单
         ice_signals = self.iceberg.detect(trades)
         for s in ice_signals:
             s["source"] = "iceberg"
             all_signals.append(s)
-        
-        # 5. CVD 背离
+
+        # 5. CVD 背离（结构性）
         div = self.delta.get_divergence()
         if div != "none":
             all_signals.append({
@@ -1113,7 +1243,7 @@ class OrderFlowSignalEngine:
                 "direction": div,
                 "bias": "bullish" if div == "bullish_div" else "bearish",
             })
-        
+
         # 6. 速度动量
         momentum = self.speed.get_momentum()
         if momentum in ("accelerating_buy", "accelerating_sell"):
@@ -1123,7 +1253,7 @@ class OrderFlowSignalEngine:
                 "direction": momentum,
                 "bias": "bullish" if momentum == "accelerating_buy" else "bearish",
             })
-        
+
         self.signals = all_signals
         return all_signals
     
@@ -1140,9 +1270,11 @@ class OrderFlowSignalEngine:
         bearish_count = sum(1 for s in self.signals if s.get("bias") == "bearish")
         total = len(self.signals)
         
-        # 加权评分（吸收和堆叠失衡权重更高）
+        # 加权评分（吸收和堆叠失衡权重更高，跨 K 线失衡权重最高）
         weights = {
             "absorption": 3.0,
+            "cross_bar_buy_imbalance": 3.5,
+            "cross_bar_sell_imbalance": 3.5,
             "stacked_buy_imbalance": 2.5,
             "stacked_sell_imbalance": 2.5,
             "exhaustion": 2.0,
