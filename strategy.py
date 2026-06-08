@@ -26,7 +26,7 @@ from orderflow import (
     MarketRegimeDetector, ATRCalculator, BookImbalance,
     MultiTimeframeConfirm, OIFundingAnalyzer, AdaptiveParams,
     DynamicPositionSizer, TradeJournal, EnhancedSignalEngine,
-    auto_tick_size,
+    MarketReasoning, auto_tick_size,
 )
 from trader import (
     place_order, get_positions, get_balance,
@@ -376,6 +376,9 @@ def run_strategy(dry_run=False):
     # 初始化交易日志
     journal = TradeJournal() if cfg.get("use_enhanced_engine") else None
 
+    # 初始化 AI 终审官
+    ai_reasoner = MarketReasoning()
+
     # 初始化动态仓位管理
     sizer = DynamicPositionSizer(
         account_balance=cfg["account_balance"],
@@ -654,6 +657,48 @@ def run_strategy(dry_run=False):
                 same_dir = [s for s in signals if s.direction == best.direction]
 
                 if len(same_dir) >= min_signals:
+                    # === AI 终审：规则信号通过后，AI 有一票否决权 ===
+                    ai_verdict = None
+                    ai_report = None
+                    try:
+                        vah_val, val_val, poc_val = engine.volume_profile.get_value_area()
+                        # 计算 ATR
+                        prices = [float(t["p"]) for t in trades[-200:]]
+                        atr_pct_val = 0.0
+                        if len(prices) > 14:
+                            trs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
+                            atr_val = sum(trs[-14:]) / 14
+                            atr_pct_val = atr_val / current_price * 100 if current_price else 0
+
+                        ai_report = ai_reasoner.analyze_with_ai(
+                            price=current_price,
+                            poc=poc_val, vah=vah_val, val=val_val,
+                            cvd=engine.delta.cvd, delta=engine.delta.current_delta,
+                            signals=signals,
+                            trades=trades,
+                            depth_bids=None, depth_asks=None,
+                            atr_pct=atr_pct_val,
+                        )
+                        if ai_report and not ai_report.get("error"):
+                            ai_verdict = ai_report.get("verdict", "WAIT")
+                            ai_conf = ai_report.get("confidence", 0)
+                            print(f"  🧠 AI 终审: {ai_verdict} ({ai_conf}%)")
+
+                            # AI 否决：方向不一致或建议观望
+                            if ai_verdict in ("WAIT", "AVOID"):
+                                print(f"  🚫 AI 否决: {ai_verdict} — 不开仓")
+                                continue
+                            elif ai_verdict == "LONG" and best.direction != "long":
+                                print(f"  🚫 AI 否决: 信号做空但 AI 看多 — 不开仓")
+                                continue
+                            elif ai_verdict == "SHORT" and best.direction != "short":
+                                print(f"  🚫 AI 否决: 信号做多但 AI 看空 — 不开仓")
+                                continue
+                        else:
+                            print(f"  ⚠️ AI 未返回有效结果，规则引擎放行")
+                    except Exception as e:
+                        print(f"  ⚠️ AI 终审异常: {e}，规则引擎放行")
+
                     # 动态仓位计算
                     qty = cfg["default_qty"]
                     if sizer and cfg.get("use_dynamic_position"):
