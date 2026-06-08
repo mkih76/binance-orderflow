@@ -79,6 +79,7 @@ class DashboardData:
         # 分析报告（每 2 分钟更新）
         self.analysis_report = None
         self.analysis_time = 0
+        self.analysis_history = deque(maxlen=50)  # 保存历史推理
         
         # 交易状态
         self.balance = {}
@@ -188,6 +189,15 @@ class DashboardData:
 
             self.analysis_report = report
             self.analysis_time = now
+
+            # 存入历史（带时间戳）
+            history_entry = {
+                "time": now,
+                "time_str": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "report": report,
+            }
+            self.analysis_history.append(history_entry)
+
             return report
 
         except Exception as e:
@@ -365,6 +375,11 @@ def api_analysis():
     if report:
         return jsonify(report)
     return jsonify({"error": "数据不足，等待更多成交"}), 503
+
+@app.route('/api/analysis/history')
+def api_analysis_history():
+    history = list(data.analysis_history)
+    return jsonify({"ok": True, "history": history})
 
 @app.route('/api/trade/<direction>/<float:qty>')
 def api_trade(direction, qty):
@@ -629,50 +644,41 @@ body { background: #0a0a0f; color: #e0e0e0; font-family: 'SF Mono', 'Fira Code',
     </div>
   </div>
 
-  <!-- 底部: 交易员分析（全宽，每 2 分钟更新）-->
+  <!-- 底部: 交易员分析对话框（全宽，每 2 分钟更新）-->
   <div class="card" style="grid-column: 1 / -1;">
-    <div class="card-title">🧠 交易员分析 <span id="analysisTime" style="float:right;color:#555;">--</span></div>
-    <div style="display:grid;grid-template-columns:280px 1fr 280px;gap:16px;">
-      <!-- 左: 结论 + 行动方案 -->
-      <div>
-        <div id="verdictBox" style="text-align:center;padding:16px;border-radius:8px;background:rgba(255,165,2,0.1);border:1px solid #ffa502;margin-bottom:12px;">
-          <div style="font-size:11px;color:#888;">结论</div>
-          <div id="verdictText" style="font-size:28px;font-weight:bold;margin:6px 0;">--</div>
-          <div id="verdictConf" style="font-size:14px;color:#aaa;">置信度 --%</div>
-          <div id="verdictReason" style="font-size:11px;color:#888;margin-top:8px;text-align:left;">--</div>
-        </div>
+    <div class="card-title">🧠 交易员分析 <span style="float:right;color:#555;font-size:11px;">每 2 分钟自动更新 | 点击展开详情</span></div>
+    <!-- 当前结论（始终可见） -->
+    <div style="display:flex;gap:12px;margin-bottom:12px;">
+      <div id="verdictBox" style="flex:0 0 200px;text-align:center;padding:16px;border-radius:8px;background:rgba(255,165,2,0.1);border:1px solid #ffa502;">
+        <div style="font-size:11px;color:#888;">当前结论</div>
+        <div id="verdictText" style="font-size:28px;font-weight:bold;margin:6px 0;">--</div>
+        <div id="verdictConf" style="font-size:14px;color:#aaa;">置信度 --%</div>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;gap:8px;">
         <div id="actionPlan" style="font-size:12px;">
-          <div style="font-size:12px;font-weight:bold;color:#888;margin-bottom:6px;">📋 行动方案</div>
           <div id="actionEntry" class="metric"><span class="metric-label">入场</span><span class="metric-value" id="aEntry">--</span></div>
           <div id="actionSL" class="metric"><span class="metric-label">止损</span><span class="metric-value negative" id="aSL">--</span></div>
           <div id="actionTP" class="metric"><span class="metric-label">止盈</span><span class="metric-value positive" id="aTP">--</span></div>
           <div id="actionRR" class="metric"><span class="metric-label">盈亏比</span><span class="metric-value" id="aRR">--</span></div>
-          <div id="actionAdvice" style="margin-top:6px;padding:6px;background:#0d0d14;border-radius:4px;font-size:11px;color:#888;">--</div>
+          <div id="actionAdvice" style="margin-top:4px;padding:4px 6px;background:#0d0d14;border-radius:4px;font-size:11px;color:#888;">--</div>
+        </div>
+        <div id="riskNote" style="padding:6px 8px;background:rgba(255,71,87,0.08);border-radius:4px;font-size:11px;color:#ff4757;display:none;">
+          <span style="font-weight:bold;">⚠️ </span><span id="riskNoteText"></span>
         </div>
       </div>
-      <!-- 中: 推理过程 -->
-      <div>
-        <div style="font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">💭 推理过程</div>
-        <div id="reasoningSteps" style="font-size:12px;line-height:1.8;min-height:120px;">等待数据...</div>
-        <div id="watchFor" style="margin-top:12px;padding:8px;background:#0d0d14;border-radius:4px;font-size:11px;color:#888;display:none;">
-          <div style="font-weight:bold;color:#aaa;margin-bottom:4px;">👀 观望时关注：</div>
-          <div id="watchForList"></div>
-        </div>
-      </div>
-      <!-- 右: 多空力量 + 关键价位 -->
-      <div>
-        <div style="font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">⚖️ 多空力量</div>
-        <div id="factorsBull" style="font-size:11px;margin-bottom:8px;"></div>
-        <div id="factorsBear" style="font-size:11px;margin-bottom:12px;"></div>
-        <div style="font-size:13px;font-weight:bold;color:#888;margin-bottom:8px;">📍 关键价位</div>
+      <div style="flex:0 0 200px;font-size:11px;">
+        <div style="font-weight:bold;color:#888;margin-bottom:6px;">📍 关键价位</div>
         <div class="metric"><span class="metric-label">POC</span><span class="metric-value" id="aPoc">--</span></div>
         <div class="metric"><span class="metric-label">VAH</span><span class="metric-value" id="aVah">--</span></div>
         <div class="metric"><span class="metric-label">VAL</span><span class="metric-value" id="aVal">--</span></div>
-        <div id="riskNote" style="margin-top:12px;padding:8px;background:rgba(255,71,87,0.08);border-radius:4px;font-size:11px;color:#ff4757;display:none;">
-          <div style="font-weight:bold;margin-bottom:4px;">⚠️ 风险提示</div>
-          <div id="riskNoteText"></div>
-        </div>
       </div>
+    </div>
+    <!-- 对话框：历史推理记录 -->
+    <div id="chatContainer" style="height:400px;overflow-y:auto;padding:8px;background:#08080e;border-radius:6px;border:1px solid #1a1a2e;">
+      <div style="text-align:center;color:#555;padding:40px 0;">等待分析数据...</div>
+    </div>
+    <div style="text-align:center;margin-top:6px;">
+      <button onclick="loadAnalysisHistory()" style="background:#1e1e2e;color:#888;border:1px solid #333;border-radius:4px;padding:4px 16px;cursor:pointer;font-size:11px;">📜 加载历史记录</button>
     </div>
   </div>
 </div>
@@ -1050,40 +1056,151 @@ function refreshOrders() {
 refreshOrders();
 setInterval(refreshOrders, 60000);
 
-// === 走势分析（每 2 分钟刷新）===
+// === 走势分析（对话框样式，每 2 分钟刷新）===
 function fmtPrice(n) { return n ? '$' + Number(n).toLocaleString(undefined, {maximumFractionDigits:1}) : '--'; }
+
+// 存储已渲染的消息，避免重复
+window._renderedTimes = new Set();
+
+function buildChatBubble(d, timeStr, isHistory) {
+  const verdictColors = {LONG:'#00d4aa', SHORT:'#ff4757', WAIT:'#ffa502', AVOID:'#ff4757'};
+  const verdictIcons = {LONG:'🟢', SHORT:'🔴', WAIT:'⚪', AVOID:'🚫'};
+  const vColor = verdictColors[d.verdict] || '#ffa502';
+  const vIcon = verdictIcons[d.verdict] || '⚪';
+  const verdictZh = d.verdict_zh || '--';
+  const conf = d.confidence || 0;
+
+  // 行动方案
+  const ap = d.action_plan || {};
+  let actionHtml = '';
+  if (d.verdict === 'LONG' || d.verdict === 'SHORT') {
+    actionHtml = '<div style="margin-top:8px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;font-size:11px;">'
+      + '<span style="color:#888;">入场</span> <b>' + fmtPrice(ap.entry) + '</b> | '
+      + '<span style="color:#ff4757;">止损</span> <b>' + fmtPrice(ap.stop_loss) + '</b> | '
+      + '<span style="color:#00d4aa;">止盈</span> <b>' + fmtPrice(ap.take_profit) + '</b> | '
+      + '<span style="color:#888;">盈亏比</span> <b>' + (ap.risk_reward || 0) + 'R</b>'
+      + (ap.position_advice ? '<br><span style="color:#666;">' + ap.position_advice + '</span>' : '')
+      + '</div>';
+  } else {
+    actionHtml = '<div style="margin-top:8px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;font-size:11px;color:#888;">'
+      + (ap.reason || '等待更好的机会')
+      + (ap.watch_for && ap.watch_for.length > 0 ? '<br>👀 ' + ap.watch_for.join(' | ') : '')
+      + '</div>';
+  }
+
+  // 推理步骤
+  const steps = d.reasoning_steps || [];
+  let stepsHtml = '';
+  if (steps.length > 0) {
+    stepsHtml = '<div class="chat-steps" style="display:none;margin-top:8px;padding:8px;background:#0a0a12;border-radius:4px;font-size:11px;line-height:1.7;">';
+    steps.forEach(s => {
+      if (s && s.thought) {
+        stepsHtml += '<div style="padding:3px 0;border-bottom:1px solid #151520;">' + s.thought + '</div>';
+      }
+    });
+    stepsHtml += '</div>';
+  }
+
+  // 多空因素
+  const bulls = d.factors_bull || [];
+  const bears = d.factors_bear || [];
+  let factorsHtml = '<div class="chat-factors" style="display:none;margin-top:6px;font-size:11px;">';
+  if (bulls.length > 0) {
+    factorsHtml += '<div style="color:#00d4aa;font-weight:bold;">多方</div>';
+    bulls.forEach(f => { factorsHtml += '<div style="padding:1px 0;">🟢 ' + f[0] + ' <span style="color:#555">(w' + f[1] + ')</span></div>'; });
+  }
+  if (bears.length > 0) {
+    factorsHtml += '<div style="color:#ff4757;font-weight:bold;margin-top:4px;">空方</div>';
+    bears.forEach(f => { factorsHtml += '<div style="padding:1px 0;">🔴 ' + f[0] + ' <span style="color:#555">(w' + f[1] + ')</span></div>'; });
+  }
+  factorsHtml += '</div>';
+
+  // 关键价位
+  const lv = d.levels || {};
+  let levelsHtml = '';
+  if (lv.poc || lv.vah || lv.val) {
+    levelsHtml = '<div class="chat-levels" style="display:none;margin-top:6px;font-size:11px;color:#888;">'
+      + 'POC=' + fmtPrice(lv.poc) + ' VAH=' + fmtPrice(lv.vah) + ' VAL=' + fmtPrice(lv.val) + '</div>';
+  }
+
+  // 风险提示
+  const riskNote = d.risk_note || '';
+  let riskHtml = '';
+  if (riskNote && riskNote.length > 10) {
+    riskHtml = '<div style="margin-top:6px;padding:4px 6px;background:rgba(255,71,87,0.08);border-radius:4px;font-size:11px;color:#ff4757;">⚠️ ' + riskNote.replace(/^【风险】/, '') + '</div>';
+  }
+
+  // 组装气泡
+  const bubble = document.createElement('div');
+  bubble.className = 'chat-bubble';
+  bubble.style.cssText = 'padding:10px 12px;margin:6px 0;border-radius:6px;background:#12121a;border-left:3px solid ' + vColor + ';cursor:pointer;';
+  bubble.setAttribute('data-time', timeStr);
+
+  bubble.innerHTML = ''
+    + '<div style="display:flex;justify-content:space-between;align-items:center;">'
+    + '  <div style="font-size:11px;color:#555;">' + timeStr + (isHistory ? '' : ' · 最新') + '</div>'
+    + '  <div style="font-size:13px;font-weight:bold;color:' + vColor + ';">' + vIcon + ' ' + verdictZh + ' <span style="font-size:11px;color:#888;">' + conf + '%</span></div>'
+    + '</div>'
+    + '<div style="font-size:11px;color:#aaa;margin-top:4px;">' + (d.verdict_reason || '') + '</div>'
+    + actionHtml
+    + riskHtml
+    + stepsHtml
+    + factorsHtml
+    + levelsHtml
+    + '<div style="text-align:right;margin-top:4px;"><span style="font-size:10px;color:#444;">点击展开/收起详情</span></div>';
+
+  // 点击展开/收起详情
+  bubble.addEventListener('click', function() {
+    const details = bubble.querySelectorAll('.chat-steps, .chat-factors, .chat-levels');
+    details.forEach(el => {
+      el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    });
+  });
+
+  return bubble;
+}
+
+function appendChatBubble(d, timeStr, isHistory) {
+  const container = document.getElementById('chatContainer');
+  if (!container) return;
+
+  // 去掉"等待数据"占位
+  const placeholder = container.querySelector('div[style*="text-align:center"]');
+  if (placeholder && placeholder.textContent.includes('等待')) {
+    container.innerHTML = '';
+  }
+
+  // 避免重复（同一时间戳只渲染一次）
+  if (window._renderedTimes.has(timeStr)) return;
+  window._renderedTimes.add(timeStr);
+
+  const bubble = buildChatBubble(d, timeStr, isHistory);
+  container.appendChild(bubble);
+
+  // 自动滚动到底部
+  container.scrollTop = container.scrollHeight;
+}
 
 function updateAnalysis(d) {
   if (!d || d.error) return;
 
-  // 时间
-  document.getElementById('analysisTime').textContent = d.time_str || '--';
+  const timeStr = d.time_str || new Date().toTimeString().slice(0,8);
 
-  // === 结论 ===
+  // 更新顶部当前结论
   const verdictColors = {LONG:'#00d4aa', SHORT:'#ff4757', WAIT:'#ffa502', AVOID:'#ff4757'};
-  const verdictBox = document.getElementById('verdictBox');
   const vColor = verdictColors[d.verdict] || '#ffa502';
+  const verdictBox = document.getElementById('verdictBox');
+  if (d.verdict === 'LONG') verdictBox.style.background = 'rgba(0,212,170,0.15)';
+  else if (d.verdict === 'SHORT') verdictBox.style.background = 'rgba(255,71,87,0.15)';
+  else verdictBox.style.background = 'rgba(255,165,2,0.15)';
   verdictBox.style.borderColor = vColor;
-  verdictBox.style.background = vColor.replace(')', ',0.1)').replace('rgb', 'rgba').replace('#', '');
-  // 直接用 rgba
-  if (d.verdict === 'LONG') verdictBox.style.background = 'rgba(0,212,170,0.1)';
-  else if (d.verdict === 'SHORT') verdictBox.style.background = 'rgba(255,71,87,0.1)';
-  else verdictBox.style.background = 'rgba(255,165,2,0.1)';
-
   document.getElementById('verdictText').textContent = d.verdict_zh || '--';
   document.getElementById('verdictText').style.color = vColor;
   document.getElementById('verdictConf').textContent = '置信度 ' + (d.confidence || 0) + '%';
-  document.getElementById('verdictReason').textContent = d.verdict_reason || '';
 
-  // === 行动方案 ===
+  // 行动方案
   const ap = d.action_plan || {};
-  if (d.verdict === 'WAIT' || d.verdict === 'AVOID') {
-    document.getElementById('actionEntry').style.display = 'none';
-    document.getElementById('actionSL').style.display = 'none';
-    document.getElementById('actionTP').style.display = 'none';
-    document.getElementById('actionRR').style.display = 'none';
-    document.getElementById('actionAdvice').textContent = ap.reason || '等待更好的机会';
-  } else {
+  if (d.verdict === 'LONG' || d.verdict === 'SHORT') {
     document.getElementById('actionEntry').style.display = '';
     document.getElementById('actionSL').style.display = '';
     document.getElementById('actionTP').style.display = '';
@@ -1093,50 +1210,21 @@ function updateAnalysis(d) {
     document.getElementById('aTP').textContent = fmtPrice(ap.take_profit);
     document.getElementById('aRR').textContent = (ap.risk_reward || 0) + 'R';
     document.getElementById('actionAdvice').textContent = ap.position_advice || '';
-  }
-
-  // 观望时关注
-  const watchFor = ap.watch_for || [];
-  const watchBox = document.getElementById('watchFor');
-  if (watchFor.length > 0 && (d.verdict === 'WAIT' || d.verdict === 'AVOID')) {
-    watchBox.style.display = 'block';
-    document.getElementById('watchForList').innerHTML = watchFor.map(w => '• ' + w).join('<br>');
   } else {
-    watchBox.style.display = 'none';
+    document.getElementById('actionEntry').style.display = 'none';
+    document.getElementById('actionSL').style.display = 'none';
+    document.getElementById('actionTP').style.display = 'none';
+    document.getElementById('actionRR').style.display = 'none';
+    document.getElementById('actionAdvice').textContent = ap.reason || '等待更好的机会';
   }
 
-  // === 推理过程 ===
-  const steps = d.reasoning_steps || [];
-  let stepsHtml = '';
-  steps.forEach(s => {
-    if (s && s.thought) {
-      stepsHtml += '<div style="padding:6px 0;border-bottom:1px solid #1a1a2e;line-height:1.6;">' + s.thought + '</div>';
-    }
-  });
-  document.getElementById('reasoningSteps').innerHTML = stepsHtml || '<div style="color:#666">等待数据...</div>';
-
-  // === 多空力量 ===
-  let bullHtml = '<div style="color:#00d4aa;font-weight:bold;margin-bottom:4px;">多方因素</div>';
-  (d.factors_bull || []).forEach(f => {
-    bullHtml += '<div style="padding:2px 0;">🟢 ' + f[0] + ' <span style="color:#666">(权重' + f[1] + ')</span></div>';
-  });
-  if (!d.factors_bull || d.factors_bull.length === 0) bullHtml += '<div style="color:#666">无</div>';
-  document.getElementById('factorsBull').innerHTML = bullHtml;
-
-  let bearHtml = '<div style="color:#ff4757;font-weight:bold;margin-bottom:4px;">空方因素</div>';
-  (d.factors_bear || []).forEach(f => {
-    bearHtml += '<div style="padding:2px 0;">🔴 ' + f[0] + ' <span style="color:#666">(权重' + f[1] + ')</span></div>';
-  });
-  if (!d.factors_bear || d.factors_bear.length === 0) bearHtml += '<div style="color:#666">无</div>';
-  document.getElementById('factorsBear').innerHTML = bearHtml;
-
-  // === 关键价位 ===
+  // 关键价位
   const lv = d.levels || {};
   document.getElementById('aPoc').textContent = fmtPrice(lv.poc);
   document.getElementById('aVah').textContent = fmtPrice(lv.vah);
   document.getElementById('aVal').textContent = fmtPrice(lv.val);
 
-  // === 风险提示 ===
+  // 风险提示
   const riskNote = d.risk_note || '';
   const riskBox = document.getElementById('riskNote');
   if (riskNote && riskNote.length > 10) {
@@ -1145,6 +1233,9 @@ function updateAnalysis(d) {
   } else {
     riskBox.style.display = 'none';
   }
+
+  // 追加到对话框
+  appendChatBubble(d, timeStr, false);
 }
 
 // 首次加载 + 每 2 分钟刷新（失败时 10 秒重试）
@@ -1165,6 +1256,21 @@ function fetchAnalysis() {
 }
 fetchAnalysis();
 setInterval(fetchAnalysis, 120000);
+
+// 加载历史推理记录
+function loadAnalysisHistory() {
+  fetch('/api/analysis/history').then(r => r.json()).then(d => {
+    if (!d.ok || !d.history) return;
+    const container = document.getElementById('chatContainer');
+    container.innerHTML = '';
+    window._renderedTimes = new Set();
+    d.history.forEach(h => {
+      if (h.report && !h.report.error) {
+        appendChatBubble(h.report, h.time_str, true);
+      }
+    });
+  }).catch(() => {});
+}
 </script>
 </body>
 </html>
