@@ -60,8 +60,8 @@ CONFIG = {
     "take_profit_2r": 0.013,    # 2R 止盈
     "trailing_stop_1r": True,   # 盈利 1R 后移动止损
     
-    # 交易时段 (UTC)
-    "active_hours": (14, 22),   # 14:00-22:00 UTC
+    # 交易时段 (UTC) — 0-24 = 全天候
+    "active_hours": (0, 24),
     
     # 数据
     "trade_lookback": 1000,     # 回看成交笔数
