@@ -499,17 +499,26 @@ def run_strategy(dry_run=False):
                     save_state(state)
                     continue
 
-                # 止盈
-                if (direction == "long" and current_price >= tp) or \
-                   (direction == "short" and current_price <= tp):
+                # 止盈 — 分批止盈：2R 平一半 + 移止损到 1R，3R 全平
+                risk = abs(entry - sl)
+                if direction == "long":
+                    tp_2r = entry + risk * 2  # 2R 价位
+                    tp_3r = entry + risk * 3  # 3R 价位
+                else:
+                    tp_2r = entry - risk * 2
+                    tp_3r = entry - risk * 3
+
+                # 3R 全平
+                if (direction == "long" and current_price >= tp_3r) or \
+                   (direction == "short" and current_price <= tp_3r):
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
                     pnl_pct = pnl / entry * 100
                     pnl_usdt = pnl * pos["qty"]
-                    print(f"  🟢 止盈触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)")
+                    print(f"  🟢 3R止盈! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)")
 
                     if journal:
                         trade_id = pos.get("trade_id", f"T{state['total_trades']}")
-                        journal.log_exit(trade_id, current_price, "take_profit", pnl, pnl_pct, hold_time)
+                        journal.log_exit(trade_id, current_price, "take_profit_3r", pnl, pnl_pct, hold_time)
 
                     if not dry_run:
                         cancel_all_orders(cfg["symbol"])
@@ -525,6 +534,51 @@ def run_strategy(dry_run=False):
                     state["total_wins"] += 1
                     save_state(state)
                     continue
+
+                # 2R 平一半 + 移止损到 1R（只执行一次）
+                if not pos.get("partial_closed") and \
+                   ((direction == "long" and current_price >= tp_2r) or \
+                    (direction == "short" and current_price <= tp_2r)):
+                    half_qty = round(pos["qty"] / 2, 4)
+                    if half_qty >= 0.001:  # 至少最小下单量
+                        pnl = (current_price - entry) if direction == "long" else (entry - current_price)
+                        pnl_pct = pnl / entry * 100
+                        pnl_usdt = pnl * half_qty
+                        print(f"  🟢 2R止盈! 平一半 {half_qty} BTC @ {current_price:.1f} PnL={pnl_pct:+.2f}% ({pnl_usdt:+.2f} USDT)")
+
+                        if journal:
+                            trade_id = pos.get("trade_id", f"T{state['total_trades']}")
+                            journal.log_exit(trade_id, current_price, "take_profit_2r_half", pnl, pnl_pct, hold_time)
+
+                        if not dry_run:
+                            cancel_all_orders(cfg["symbol"])
+                            close_side = "SELL" if direction == "long" else "BUY"
+                            close_result = place_order(cfg["symbol"], close_side, "MARKET", half_qty)
+                            if close_result and journal:
+                                journal.log_order(trade_id, close_result, "short" if direction=="long" else "long", half_qty, current_price, "close")
+
+                        # 更新状态：减仓 + 止损移到 1R
+                        new_qty = round(pos["qty"] - half_qty, 4)
+                        if direction == "long":
+                            new_sl = entry + risk * 0.5  # 1R 位置（保本+0.5R）
+                        else:
+                            new_sl = entry - risk * 0.5
+
+                        state["open_position"]["qty"] = new_qty
+                        state["open_position"]["partial_closed"] = True
+                        state["open_position"]["stop_loss"] = new_sl
+                        state["daily_pnl"] += pnl_usdt
+
+                        # 重新下止损单（用新数量和新止损价）
+                        if not dry_run:
+                            close_side = "SELL" if direction == "long" else "BUY"
+                            sl_order = place_stop_order(cfg["symbol"], close_side, new_sl, new_qty)
+                            if sl_order:
+                                state["open_position"]["sl_order_id"] = sl_order.get("orderId")
+
+                        save_state(state)
+                        print(f"  📍 剩余仓位 {new_qty} BTC，止损移到 {new_sl:.1f} (1R)")
+                        continue
 
                 # 超时平仓
                 if hold_time > cfg["max_hold_minutes"]:
