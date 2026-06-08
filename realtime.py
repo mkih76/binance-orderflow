@@ -19,7 +19,9 @@ import threading
 import sys
 import os
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+BJT = timezone(timedelta(hours=8))
 
 # SOCKS5 代理 — 从 config 读取，不全局 monkey-patch
 import os
@@ -499,7 +501,7 @@ def run_realtime(dry_run=True):
             
             # 定期报告（每 60 秒）
             if now - last_report >= WS_CONFIG["report_interval"]:
-                print(f"\n\n  📊 定期报告 ({datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC)")
+                print(f"\n\n  📊 定期报告 ({datetime.now(BJT).strftime('%H:%M:%S')} 北京时间)")
                 print(f"  {'─'*50}")
                 
                 # Delta/CVD

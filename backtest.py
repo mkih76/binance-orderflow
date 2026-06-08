@@ -16,7 +16,9 @@ import os
 import time
 import json
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+BJT = timezone(timedelta(hours=8))
 from collections import deque
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -248,7 +250,7 @@ class BacktestEngine:
                     pos["stop_loss"] = new_sl
     
     def _ts_str(self, ts_ms):
-        return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%H:%M:%S")
+        return datetime.fromtimestamp(ts_ms / 1000, tz=BJT).strftime("%H:%M:%S")
     
     def _print_report(self):
         """打印回测报告"""

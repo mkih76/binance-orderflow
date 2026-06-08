@@ -31,7 +31,9 @@ import time
 import math
 import requests
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+BJT = timezone(timedelta(hours=8))
 
 # ==================== 数据采集 ====================
 
@@ -2388,7 +2390,7 @@ class MarketReasoning:
         # === 组装报告 ===
         report = {
             "timestamp": time.time(),
-            "time_str": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "time_str": datetime.now(BJT).strftime("%Y-%m-%d %H:%M 北京时间"),
             "price": price,
             "verdict": verdict,
             "verdict_zh": {"LONG": "做多", "SHORT": "做空", "WAIT": "观望", "AVOID": "回避"}[verdict],

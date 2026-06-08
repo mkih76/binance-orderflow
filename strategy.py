@@ -14,7 +14,9 @@ import sys
 import time
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+BJT = timezone(timedelta(hours=8))  # 北京时间
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -70,7 +72,7 @@ CONFIG = {
     "take_profit_2r": 0.013,    # 2R 止盈
     "trailing_stop_1r": True,   # 盈利 1R 后移动止损
 
-    # 交易时段 (UTC) — 0-24 = 全天候
+    # 交易时段 (北京时间) — 0-24 = 全天候
     "active_hours": (0, 24),
 
     # 数据
@@ -317,7 +319,7 @@ def risk_check(state, cfg):
     daily_pnl 存储的是绝对金额（USDT），不是百分比。
     每笔交易的盈亏 = pnl_pct / 100 * account_balance
     """
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(BJT).strftime("%Y-%m-%d")
 
     # 重置每日计数
     if state["last_trade_date"] != today:
@@ -338,11 +340,11 @@ def risk_check(state, cfg):
     if state["consecutive_losses"] >= cfg["max_consecutive_loss"]:
         return False, f"连续亏损 {state['consecutive_losses']} 次，停手"
 
-    # 检查交易时段
-    utc_hour = datetime.now(timezone.utc).hour
+    # 检查交易时段（北京时间）
+    bj_hour = datetime.now(BJT).hour
     start_h, end_h = cfg["active_hours"]
-    if not (start_h <= utc_hour < end_h):
-        return False, f"不在交易时段 ({start_h}:00-{end_h}:00 UTC)"
+    if not (start_h <= bj_hour < end_h):
+        return False, f"不在交易时段 ({start_h}:00-{end_h}:00 北京时间)"
 
     # 检查是否已有持仓
     if state.get("open_position"):
@@ -396,8 +398,8 @@ def run_strategy(dry_run=False):
     cycle = 0
     while True:
         cycle += 1
-        now = datetime.now(timezone.utc)
-        print(f"\n--- 周期 {cycle} | {now.strftime('%H:%M:%S')} UTC ---")
+        now = datetime.now(BJT)
+        print(f"\n--- 周期 {cycle} | {now.strftime('%H:%M:%S')} 北京时间 ---")
 
         try:
             # 1. 采集数据

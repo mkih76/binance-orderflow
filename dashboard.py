@@ -12,7 +12,9 @@ import threading
 import sys
 import os
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+BJT = timezone(timedelta(hours=8))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -138,7 +140,7 @@ class DashboardData:
         # 信号日志
         for s in self.signals:
             entry = {
-                "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "time": datetime.now(BJT).strftime("%H:%M:%S"),
                 "source": s.get("source", "?"),
                 "type": s.get("type", "?"),
                 "bias": s.get("bias", "neutral"),
@@ -193,7 +195,7 @@ class DashboardData:
             # 存入历史（带时间戳）
             history_entry = {
                 "time": now,
-                "time_str": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "time_str": datetime.now(BJT).strftime("%H:%M:%S"),
                 "report": report,
             }
             self.analysis_history.append(history_entry)
@@ -969,7 +971,9 @@ socket.on('update', (d) => {
 
 // 时钟
 setInterval(() => {
-  document.getElementById('clock').textContent = new Date().toISOString().substring(11,19) + ' UTC';
+  const now = new Date();
+  const bj = new Date(now.getTime() + 8 * 3600000);
+  document.getElementById('clock').textContent = bj.toISOString().substring(11,19) + ' 北京时间';
 }, 1000);
 
 // === 持仓 / 订单 / 成交 ===
