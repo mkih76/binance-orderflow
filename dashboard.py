@@ -149,6 +149,16 @@ class DashboardData:
             if not self.signal_log or self.signal_log[-1] != entry:
                 self.signal_log.append(entry)
     
+    def _load_open_position(self):
+        """从策略状态文件读取当前持仓"""
+        try:
+            state_file = os.path.join(BASE_DIR, "strategy_state.json")
+            with open(state_file) as f:
+                state = json.load(f)
+            return state.get("open_position")
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
     def generate_analysis(self):
         """生成走势分析报告（每 2 分钟更新一次）"""
         now = time.time()
@@ -164,38 +174,106 @@ class DashboardData:
             cvd = self.engine.delta.cvd
             delta = self.engine.delta.current_delta
             vah, val, poc = self.engine.volume_profile.get_value_area()
-            speed = self.engine.speed
-            momentum = speed.get_momentum() if hasattr(speed, 'get_momentum') else 'unknown'
 
-            # 计算 ATR
-            prices = [float(t["p"]) for t in trades[-200:]]
-            atr_pct = 0.0
-            if len(prices) > 14:
-                trs = []
-                for i in range(1, len(prices)):
-                    trs.append(abs(prices[i] - prices[i-1]))
-                atr = sum(trs[-14:]) / 14
-                atr_pct = atr / price * 100 if price else 0
+            # 检查是否有持仓
+            open_pos = self._load_open_position()
 
-            # 用 MarketReasoning 生成推理报告（AI 优先，规则兜底）
-            report = self.reasoner.analyze_with_ai(
-                price=price,
-                poc=poc, vah=vah, val=val,
-                cvd=cvd, delta=delta,
-                signals=self.signals,
-                trades=trades,
-                depth_bids=self.depth.get("bids"),
-                depth_asks=self.depth.get("asks"),
-                atr_pct=atr_pct,
-            )
+            if open_pos:
+                # === 持仓管理模式：锁定方向，只做持仓分析 ===
+                pos_dir = open_pos.get("direction", "?")
+                entry_price = open_pos.get("entry_price", 0)
+                stop_loss = open_pos.get("stop_loss", 0)
+                take_profit = open_pos.get("take_profit", 0)
+                qty = open_pos.get("qty", 0)
+                hold_time = (time.time() - open_pos.get("entry_time", time.time())) / 60
+                reason = open_pos.get("reason", "")
 
-            self.analysis_report = report
-            self.analysis_time = now
+                # 计算浮盈
+                if pos_dir == "long":
+                    unrealized_pnl = (price - entry_price) * qty
+                    unrealized_pct = (price - entry_price) / entry_price * 100 if entry_price else 0
+                    risk = entry_price - stop_loss
+                    current_rr = (price - entry_price) / risk if risk > 0 else 0
+                else:
+                    unrealized_pnl = (entry_price - price) * qty
+                    unrealized_pct = (entry_price - price) / entry_price * 100 if entry_price else 0
+                    risk = stop_loss - entry_price
+                    current_rr = (entry_price - price) / risk if risk > 0 else 0
 
-            # 存入历史（带时间戳）
-            history_entry = {
-                "time": now,
-                "time_str": datetime.now(BJT).strftime("%H:%M:%S"),
+                # 持仓风险评估
+                risk_notes = []
+                if current_rr >= 2:
+                    risk_notes.append("已达 2R，考虑平一半锁定利润")
+                if current_rr >= 3:
+                    risk_notes.append("已达 3R，建议全平")
+                if hold_time > 25:
+                    risk_notes.append(f"持仓 {hold_time:.0f} 分钟，接近 30 分钟超时限制")
+                if unrealized_pct < -0.3:
+                    risk_notes.append("浮亏较大，注意止损纪律")
+
+                report = {
+                    "timestamp": now,
+                    "time_str": datetime.now(BJT).strftime("%Y-%m-%d %H:%M 北京时间"),
+                    "price": price,
+                    "verdict": "HOLD",
+                    "verdict_zh": f"持仓{pos_dir.upper()}",
+                    "confidence": 100,
+                    "verdict_reason": f"持仓中，方向已锁定为{pos_dir}，等待出场信号",
+                    "action_plan": {
+                        "entry": entry_price,
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                        "risk_reward": round(current_rr, 1),
+                        "position_advice": f"浮盈 {unrealized_pnl:+.4f} USDT ({unrealized_pct:+.2f}%) | 持仓 {hold_time:.0f}min"
+                                           + (f" | {''.join(risk_notes)}" if risk_notes else ""),
+                        "watch_for": risk_notes,
+                    },
+                    "reasoning_steps": [
+                        {"thought": f"📊 当前持仓: {pos_dir.upper()} @ {entry_price:.1f} | 止损 {stop_loss:.1f} | 止盈 {take_profit:.1f}"},
+                        {"thought": f"💰 浮盈: {unrealized_pnl:+.4f} USDT ({unrealized_pct:+.2f}%) | 当前盈亏比: {current_rr:.1f}R"},
+                        {"thought": f"⏱️ 持仓时间: {hold_time:.0f} 分钟 | 入场理由: {reason}"},
+                        {"thought": f"📍 现价 {price:.1f} | POC={poc:.1f} VAH={vah:.1f} VAL={val:.1f}" if poc else f"📍 现价 {price:.1f}"},
+                    ],
+                    "factors_bull": [],
+                    "factors_bear": [],
+                    "levels": {"poc": poc, "vah": vah, "val": val},
+                    "risk_note": " | ".join(risk_notes) if risk_notes else "",
+                    "mode": "position_management",
+                }
+            else:
+                # === 无持仓：正常入场分析 ===
+                # 计算 ATR
+                prices = [float(t["p"]) for t in trades[-200:]]
+                atr_pct = 0.0
+                if len(prices) > 14:
+                    trs = []
+                    for i in range(1, len(prices)):
+                        trs.append(abs(prices[i] - prices[i-1]))
+                    atr = sum(trs[-14:]) / 14
+                    atr_pct = atr / price * 100 if price else 0
+
+                # 用 MarketReasoning 生成推理报告（AI 优先，规则兜底）
+                report = self.reasoner.analyze_with_ai(
+                    price=price,
+                    poc=poc, vah=vah, val=val,
+                    cvd=cvd, delta=delta,
+                    signals=self.signals,
+                    trades=trades,
+                    depth_bids=self.depth.get("bids"),
+                    depth_asks=self.depth.get("asks"),
+                    atr_pct=atr_pct,
+                )
+                if report:
+                    report["mode"] = "entry_analysis"
+
+            if report:
+                self.analysis_report = report
+                self.analysis_time = now
+
+                # 存入历史（带时间戳）
+                history_entry = {
+                    "time": now,
+                    "time_str": datetime.now(BJT).strftime("%H:%M:%S"),
                 "report": report,
             }
             self.analysis_history.append(history_entry)
