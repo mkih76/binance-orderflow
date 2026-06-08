@@ -401,8 +401,11 @@ class DeltaTracker:
 
 class VolumeProfile:
     """
-    成交量分布：显示每个价格水平的总成交量
-    
+    成交量分布：显示每个价格水平的总成交量（滑动窗口）
+
+    只保留最近 max_trades 笔成交，反映近期市场结构。
+    旧数据自动淘汰，POC/VAH/VAL 始终基于最新行情。
+
     关键指标：
     - POC (Point of Control): 成交量最大的价格
     - VAH (Value Area High): 价值区上沿
@@ -410,24 +413,52 @@ class VolumeProfile:
     - HVN (High Volume Node): 高成交量节点（支撑/阻力）
     - LVN (Low Volume Node): 低成交量节点（价格快速通过）
     """
-    
-    def __init__(self, tick_size=0.1):
+
+    def __init__(self, tick_size=0.1, max_trades=3000):
         self.tick_size = tick_size
+        self.max_trades = max_trades
         self.profile = defaultdict(float)  # {price: volume}
         self.buy_profile = defaultdict(float)
         self.sell_profile = defaultdict(float)
-    
+        self._trade_buffer = deque(maxlen=max_trades)  # 滑动窗口
+
     def _round_price(self, price):
         return round(round(price / self.tick_size) * self.tick_size, 2)
-    
+
     def add_trades(self, trades):
-        """添加成交数据"""
+        """添加成交数据（滑动窗口，自动淘汰旧数据）"""
+        need_rebuild = False
         for t in trades:
             price = self._round_price(float(t["p"]))
             qty = float(t["q"])
+            is_sell = t["m"]
+
+            # 追加到缓冲区
+            self._trade_buffer.append((price, qty, is_sell))
+
+            # 窗口满了需要重建（deque maxlen 会自动丢弃最旧的）
+            if len(self._trade_buffer) == self.max_trades:
+                need_rebuild = True
+
+            # 增量更新当前 profile
             self.profile[price] += qty
-            
-            if t["m"]:
+            if is_sell:
+                self.sell_profile[price] += qty
+            else:
+                self.buy_profile[price] += qty
+
+        # 窗口满时重建 profile（清除被丢弃的旧数据影响）
+        if need_rebuild and len(self._trade_buffer) == self.max_trades:
+            self._rebuild()
+
+    def _rebuild(self):
+        """从缓冲区重建 profile（清除窗口外的旧数据）"""
+        self.profile = defaultdict(float)
+        self.buy_profile = defaultdict(float)
+        self.sell_profile = defaultdict(float)
+        for price, qty, is_sell in self._trade_buffer:
+            self.profile[price] += qty
+            if is_sell:
                 self.sell_profile[price] += qty
             else:
                 self.buy_profile[price] += qty
