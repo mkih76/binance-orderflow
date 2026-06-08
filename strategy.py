@@ -32,7 +32,7 @@ from trader import (
     place_order, get_positions, get_balance,
     get_price, api_request, get_base_url, get_current_mode,
     place_stop_order, place_take_profit_order, cancel_all_orders,
-    is_position_active
+    is_position_active, set_leverage
 )
 
 # ==================== 策略参数 ====================
@@ -702,6 +702,8 @@ def run_strategy(dry_run=False):
                         )
 
                     if not dry_run:
+                        # 确保杠杆与策略配置一致
+                        set_leverage(cfg["symbol"], cfg["leverage"])
                         side = "BUY" if best.direction == "long" else "SELL"
                         result = place_order(cfg["symbol"], side, "MARKET", qty)
 

@@ -333,6 +333,27 @@ def cancel_all_orders(symbol):
         return data
     return None
 
+def set_leverage(symbol, leverage):
+    """
+    设置合约杠杆倍数
+
+    Args:
+        symbol: 交易对，如 "BTCUSDT"
+        leverage: 杠杆倍数，1-125
+    """
+    mode = get_current_mode()
+    base = get_base_url(mode)
+    url = f"{base}/fapi/v1/leverage"
+    params = {
+        "symbol": symbol,
+        "leverage": leverage,
+    }
+    data = api_request("POST", url, params, signed=True, mode=mode)
+    if data:
+        print(f"✅ 杠杆已设为 {leverage}x ({symbol})")
+        return data
+    return None
+
 def get_all_orders(symbol="BTCUSDT", limit=20):
     """
     查询历史订单（含已成交、已取消、过期）
