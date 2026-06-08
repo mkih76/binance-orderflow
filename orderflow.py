@@ -2454,55 +2454,122 @@ class MarketReasoning:
 
     def _build_context(self, price, poc, vah, val, cvd, delta, signals, trades,
                        depth_bids, depth_asks, regime, atr_pct):
-        """构建发给 AI 的市场上下文 — 严格约束，防止幻觉"""
+        """构建发给 AI 的市场上下文 — 补全所有策略所需数据"""
 
-        # 预处理：只给 AI 关键数据，不给原始成交列表
-        recent_prices = [float(t["p"]) for t in trades[-100:]]
+        # === 价格数据 ===
+        recent_prices = [float(t["p"]) for t in trades[-200:]]
         price_high = max(recent_prices) if recent_prices else price
         price_low = min(recent_prices) if recent_prices else price
+        price_range = price_high - price_low
         price_trend = "上涨" if recent_prices[-1] > recent_prices[0] else "下跌" if recent_prices[-1] < recent_prices[0] else "横盘"
+        price_change_pct = (recent_prices[-1] - recent_prices[0]) / recent_prices[0] * 100 if recent_prices else 0
 
-        recent_vols = [float(t["q"]) for t in trades[-100:]]
+        # === 成交量数据 ===
+        recent_vols = [float(t["q"]) for t in trades[-200:]]
         avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
 
-        # 预处理信号：只提取有信号的类型，不给 AI 原始列表
+        # === 速度数据（Speed of Tape）===
+        # 最近20笔 vs 前100笔的成交速度对比
+        if len(trades) >= 120:
+            recent_20_vols = [float(t["q"]) for t in trades[-20:]]
+            prev_100_vols = [float(t["q"]) for t in trades[-120:-20]]
+            recent_avg = sum(recent_20_vols) / 20
+            prev_avg = sum(prev_100_vols) / 100 if prev_100_vols else 1
+            speed_ratio = recent_avg / prev_avg if prev_avg > 0 else 1.0
+            # 最近20笔的时间跨度
+            recent_20_time = (trades[-1]["T"] - trades[-20]["T"]) / 1000  # 秒
+            prev_100_time = (trades[-20]["T"] - trades[-120]["T"]) / 1000 if len(trades) >= 120 else 1
+            recent_rate = 20 / recent_20_time if recent_20_time > 0 else 0
+            prev_rate = 100 / prev_100_time if prev_100_time > 0 else 0
+            rate_ratio = recent_rate / prev_rate if prev_rate > 0 else 1.0
+            if rate_ratio > 1.5 and speed_ratio > 1.3:
+                speed_desc = f"加速（频率{rate_ratio:.1f}x, 量{speed_ratio:.1f}x）"
+                speed_accel = True
+            elif rate_ratio < 0.7:
+                speed_desc = f"减速（频率{rate_ratio:.1f}x）"
+                speed_accel = False
+            else:
+                speed_desc = f"平稳（频率{rate_ratio:.1f}x, 量{speed_ratio:.1f}x）"
+                speed_accel = False
+        else:
+            speed_desc = "数据不足"
+            speed_accel = False
+
+        # === CVD 趋势（最近50笔 vs 前50笔）===
+        cvd_recent = 0
+        cvd_prev = 0
+        for t in trades[-50:]:
+            if t.get("m"):
+                cvd_recent -= float(t["q"])
+            else:
+                cvd_recent += float(t["q"])
+        for t in trades[-100:-50]:
+            if t.get("m"):
+                cvd_prev -= float(t["q"])
+            else:
+                cvd_prev += float(t["q"])
+        cvd_trend = "上升" if cvd_recent > cvd_prev * 1.2 else "下降" if cvd_recent < cvd_prev * 0.8 else "平稳"
+
+        # === 价格与关键位距离 ===
+        def dist_to(level):
+            if not level or level == 'N/A':
+                return "N/A"
+            d = abs(price - level) / level * 100
+            return f"{d:.3f}% ({'紧贴' if d < 0.1 else '靠近' if d < 0.3 else '远离'})"
+
+        # === Delta 强度 ===
+        delta_list = []
+        for t in trades[-50:]:
+            if t.get("m"):
+                delta_list.append(-float(t["q"]))
+            else:
+                delta_list.append(float(t["q"]))
+        delta_recent_5 = sum(delta_list[-5:]) if len(delta_list) >= 5 else 0
+        delta_avg_abs = sum(abs(d) for d in delta_list) / len(delta_list) if delta_list else 1
+        delta_strength = abs(delta_recent_5) / delta_avg_abs if delta_avg_abs > 0 else 0
+        delta_desc = f"最近5笔Delta={delta_recent_5:+.2f}, 强度={delta_strength:.1f}x均值"
+
+        # === 信号事实提取 ===
         signal_evidence = []
-        has_stacked_buy = False
-        has_stacked_sell = False
-        has_absorption = False
-        has_exhaustion = False
-        has_iceberg = False
+        absorption_details = []
         for s in signals:
             src = s.get("source", "")
             bias = s.get("bias", "neutral")
             if src == "stacked_imbalance" and bias == "bullish":
-                has_stacked_buy = True
                 levels = s.get("levels", 0)
-                signal_evidence.append(f"买方堆叠失衡 {levels} 层")
+                signal_evidence.append(f"买方堆叠失衡 {levels} 层 ✅")
             elif src == "stacked_imbalance" and bias == "bearish":
-                has_stacked_sell = True
                 levels = s.get("levels", 0)
-                signal_evidence.append(f"卖方堆叠失衡 {levels} 层")
+                signal_evidence.append(f"卖方堆叠失衡 {levels} 层 ✅")
             elif src == "absorption":
-                has_absorption = True
                 direction = s.get("direction", "")
                 z = s.get("z_score", 0)
-                signal_evidence.append(f"吸收事件 ({direction}, Z={z:.1f})")
+                imbalance = s.get("net_imbalance", 0)
+                impact = s.get("price_impact", 0)
+                signal_evidence.append(f"吸收事件 ({direction}, Z={z:.1f}, 失衡={imbalance:.0%}, 价格影响={impact:.2f}) ✅")
+                absorption_details.append({"direction": direction, "z": z, "imbalance": imbalance, "impact": impact})
             elif src == "exhaustion":
-                has_exhaustion = True
-                signal_evidence.append(f"成交量衰竭 ({bias})")
+                signal_evidence.append(f"成交量衰竭 ({bias}) ✅")
             elif src == "iceberg":
-                has_iceberg = True
-                signal_evidence.append("冰山单")
+                signal_evidence.append("冰山单 ✅")
+            elif src == "speed_of_tape":
+                stype = s.get("type", "")
+                signal_evidence.append(f"速度信号 ({stype}) ✅")
+            elif src == "cross_bar_buy_imbalance":
+                signal_evidence.append("跨K线买方失衡 ✅")
+            elif src == "cross_bar_sell_imbalance":
+                signal_evidence.append("跨K线卖方失衡 ✅")
+            elif src == "cvd_divergence":
+                signal_evidence.append(f"CVD背离 ({bias}) ✅")
 
-        n_signals = len(signal_evidence)
-
-        # 订单簿
+        # === 订单簿 ===
         book_info = "无数据"
         if depth_bids and depth_asks:
             bid_total = sum(q for _, q in depth_bids[:5])
             ask_total = sum(q for _, q in depth_asks[:5])
-            book_info = f"买盘前5: {bid_total:.2f} BTC, 卖盘前5: {ask_total:.2f} BTC, 买卖比: {bid_total/ask_total:.2f}" if ask_total > 0 else f"买盘前5: {bid_total:.2f} BTC"
+            max_bid = max(q for _, q in depth_bids[:5]) if depth_bids else 0
+            max_ask = max(q for _, q in depth_asks[:5]) if depth_asks else 0
+            book_info = f"买盘前5总量={bid_total:.2f}BTC(最大{max_bid:.2f}), 卖盘前5总量={ask_total:.2f}BTC(最大{max_ask:.2f}), 买卖比={bid_total/ask_total:.2f}" if ask_total > 0 else f"买盘前5={bid_total:.2f}BTC"
 
         context = f"""# 交易指令 — 严格执行
 
@@ -2512,37 +2579,61 @@ class MarketReasoning:
 
 ### 入场条件（满足任意一组即可）
 **信号A: 堆叠失衡+速度**
-- 条件: 3+层堆叠失衡 + 成交速度加速
+- 条件1: 3+层堆叠失衡（看"已检测到的信号事实"中有没有"堆叠失衡"）
+- 条件2: 成交速度加速（看"速度"字段是否为"加速"）
+- 两个条件都满足才算信号A成立
 - 方向: 失衡方向开仓
 - 止损: 堆叠区间外, 止盈: 2R
 
 **信号B: 吸收反转**
-- 条件: Z-Score>3.0 + 单方向失衡>60% + 价格不动 + 在VAH/VAL/POC附近
+- 条件1: Z-Score>3.0（看吸收事件的Z值）
+- 条件2: 单方向失衡>60%（看吸收事件的失衡值）
+- 条件3: 价格影响<0.8（看吸收事件的价格影响）
+- 条件4: 价格在VAH/VAL/POC附近（距离<0.3%）
+- 四个条件都满足才算信号B成立
 - 方向: 被吸收方反转开仓
 - 止损: 吸收区域外, 止盈: POC
 
 **信号C: CVD背离**
-- 条件: CVD与价格背离 + 价格在VAH/VAL附近 + 成交量衰竭
+- 条件1: CVD与价格出现背离（看"CVD趋势"与"价格趋势"是否相反）
+- 条件2: 价格在VAH/VAL附近（距离<0.3%）
+- 条件3: 有成交量衰竭信号（看信号事实中有没有"衰竭"）
+- 三个条件都满足才算信号C成立
 - 方向: 背离方向开仓
 - 止损: 背离极值点外, 止盈: POC
 
 ### 必须WAIT的情况（不可入场）
-- 信号不足2个
-- 价格在POC附近（方向不明）
-- 波动率极低（假突破多）
-- 没有任何上述信号
+- 信号A/B/C中没有任何一个全部条件满足
+- 价格紧贴POC（距离<0.1%，方向不明）
+- 波动率极低（ATR<0.3%，假突破多）
 
 ### 你只能判断以下四个结论
-- LONG: 信号A/B/C中至少2个满足且方向一致
-- SHORT: 信号A/B/C中至少2个满足且方向一致
-- WAIT: 信号不足或条件不满足
-- AVOID: 高风险环境（波动率极高、突破追高）
+- LONG: 信号A/B/C中至少1个全部条件满足且方向为做多
+- SHORT: 信号A/B/C中至少1个全部条件满足且方向为做空
+- WAIT: 没有任何信号全部条件满足
+- AVOID: 高风险环境（波动率极高ATR>2%、突破追高）
 
-## 当前数据（你只能用这些数据判断）
+## 当前数据（你只能用这些数据判断，不能编造）
 
-价格: {price:.1f} (近100笔区间: {price_low:.1f} - {price_high:.1f}, 趋势: {price_trend})
-POC: {poc or 'N/A'}  VAH: {vah or 'N/A'}  VAL: {val or 'N/A'}
-CVD: {cvd:+.0f}  Delta: {delta:+.0f}
+### 价格
+当前: {price:.1f}
+近200笔区间: {price_low:.1f} - {price_high:.1f} (幅度{price_range:.1f})
+趋势: {price_trend} (变化{price_change_pct:+.2f}%)
+
+### 关键价位
+POC: {poc or 'N/A'}  距离: {dist_to(poc)}
+VAH: {vah or 'N/A'}  距离: {dist_to(vah)}
+VAL: {val or 'N/A'}  距离: {dist_to(val)}
+
+### 订单流
+CVD: {cvd:+.0f}  CVD趋势: {cvd_trend}  Delta: {delta:+.0f}
+{delta_desc}
+
+### 速度
+{speed_desc}
+速度加速: {'是' if speed_accel else '否'}
+
+### 波动率
 ATR: {atr_pct:.2f}%  市场状态: {regime.get('regime', 'unknown') if regime else 'unknown'}
 平均成交量: {avg_vol:.4f} BTC
 
@@ -2554,12 +2645,12 @@ ATR: {atr_pct:.2f}%  市场状态: {regime.get('regime', 'unknown') if regime el
 
 ## 输出要求
 
-1. 先判断信号A/B/C各满足几个条件（逐条列出，未满足的写"不满足"）
-2. 判断是否满足入场条件
-3. 给出结论
+1. 逐条检查信号A/B/C的每个条件是否满足（用上面的数据验证）
+2. 只有所有条件都满足的信号才算成立
+3. 根据成立的信号给出结论
 
-只返回JSON，不要markdown，不要解释：
-{{"analysis":"逐条分析信号A/B/C的满足情况","verdict":"LONG/SHORT/WAIT/AVOID","confidence":0-100,"verdict_reason":"一句话","action_plan":{{"entry":数字,"stop_loss":数字,"take_profit":数字,"position_advice":"仓位建议"}}}}"""
+只返回JSON，不要markdown：
+{{"analysis":"逐条分析信号A/B/C各条件的满足情况，引用具体数据","verdict":"LONG/SHORT/WAIT/AVOID","confidence":0-100,"verdict_reason":"一句话","action_plan":{{"entry":数字,"stop_loss":数字,"take_profit":数字,"position_advice":"仓位建议"}}}}"""
         return context
 
     def _call_ai(self, context, base_url, api_key, model, max_tokens=1000):
