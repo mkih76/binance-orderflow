@@ -22,7 +22,10 @@ from orderflow import (
     fetch_aggtrades, fetch_aggtrades_full, fetch_klines, fetch_depth,
     FootprintChart, DeltaTracker, VolumeProfile,
     ImbalanceDetector, AbsorptionDetector, ExhaustionDetector,
-    IcebergDetector, SpeedOfTape, OrderFlowSignalEngine
+    IcebergDetector, SpeedOfTape, OrderFlowSignalEngine,
+    MarketRegimeDetector, ATRCalculator, BookImbalance,
+    MultiTimeframeConfirm, OIFundingAnalyzer, AdaptiveParams,
+    DynamicPositionSizer, TradeJournal, EnhancedSignalEngine,
 )
 from trader import (
     place_order, get_positions, get_balance,
@@ -35,19 +38,22 @@ from trader import (
 CONFIG = {
     "symbol": "BTCUSDT",
     "tick_size": 1.0,
-    
-    # 仓位
+
+    # 仓位（动态管理，这些是基础值）
     "default_qty": 0.005,       # 默认仓位 BTC
     "conservative_qty": 0.003,  # 保守仓位
     "min_qty": 0.001,           # 最小仓位
-    
+    "max_qty": 0.01,            # 最大仓位
+    "leverage": 3,              # 杠杆
+    "account_balance": 100,     # 账户余额 USDT
+
     # 风控
     "risk_per_trade": 0.02,     # 每笔风险 2%
     "max_daily_loss": 0.05,     # 日最大亏损 5%
     "max_daily_trades": 3,      # 日最大交易次数
     "max_consecutive_loss": 2,  # 连亏停手
     "max_hold_minutes": 30,     # 最大持仓时间
-    
+
     # 信号
     "min_signal_agreement": 2,  # 至少 2 个信号一致才入场
     "imbalance_ratio": 3.0,     # 堆叠失衡比率
@@ -55,20 +61,28 @@ CONFIG = {
     "absorption_z": 3.0,        # 吸收 Z-Score 阈值
     "absorption_imbalance": 0.6,# 吸收失衡阈值
     "absorption_impact": 0.8,   # 吸收价格影响阈值
-    
-    # 止盈止损
+
+    # 止盈止损（自适应参数会动态调整这些值）
     "stop_loss_pct": 0.0065,    # 止损 0.65%
     "take_profit_1r": 0.0065,   # 1R 止盈
     "take_profit_2r": 0.013,    # 2R 止盈
     "trailing_stop_1r": True,   # 盈利 1R 后移动止损
-    
+
     # 交易时段 (UTC) — 0-24 = 全天候
     "active_hours": (0, 24),
-    
+
     # 数据
     "trade_lookback": 1000,     # 回看成交笔数
     "kline_interval": "5m",     # K线周期
     "kline_limit": 50,          # K线数量
+
+    # 增强模块开关
+    "use_enhanced_engine": True,        # 使用增强版引擎
+    "use_dynamic_position": True,       # 使用动态仓位
+    "use_adaptive_params": True,        # 使用自适应参数
+    "use_mtf_confirm": True,            # 使用多时间框架确认
+    "use_book_imbalance": True,         # 使用订单簿失衡
+    "use_oi_funding": True,             # 使用 OI + 资金费率
 }
 
 # ==================== 策略状态 ====================
@@ -113,50 +127,64 @@ class TradingSignal:
     def __repr__(self):
         return f"Signal({self.direction} @ {self.entry_price:.1f}, SL={self.stop_loss:.1f}, TP={self.take_profit:.1f}, src={self.source})"
 
-def generate_signals(engine, trades, cfg):
+def generate_signals(engine, trades, cfg, enhanced_result=None):
     """
     从订单流引擎生成交易信号
-    
+
+    Args:
+        engine: OrderFlowSignalEngine 或 EnhancedSignalEngine
+        trades: aggTrades
+        cfg: 配置参数
+        enhanced_result: 增强版分析结果（可选）
+
     Returns:
         list of TradingSignal
     """
     signals = []
-    
+
     # 运行分析
     all_signals = engine.analyze(trades)
     consensus, confidence = engine.get_consensus()
-    
+
     # 获取关键价位
     vah, val, poc = engine.volume_profile.get_value_area()
     if not poc:
         return signals
-    
+
     current_price = float(trades[-1]["p"]) if trades else poc
-    
+
+    # 使用自适应参数（如果可用）
+    stop_pct = cfg["stop_loss_pct"]
+    tp_pct = cfg["take_profit_1r"]
+    if enhanced_result and cfg.get("use_adaptive_params"):
+        ap = enhanced_result.get("adaptive_params", {})
+        stop_pct = ap.get("stop_loss_pct", stop_pct)
+        tp_pct = ap.get("take_profit_pct", tp_pct)
+
     # ---- 信号 1: 堆叠失衡 + 速度确认 ----
     imbalance_signals = [s for s in all_signals if s.get("source") == "stacked_imbalance"]
     speed_momentum = engine.speed.get_momentum()
-    
+
     for imb in imbalance_signals:
         direction = "long" if imb["bias"] == "bullish" else "short"
-        
+
         # 速度确认
         speed_confirms = (
             (direction == "long" and speed_momentum == "accelerating_buy") or
             (direction == "short" and speed_momentum == "accelerating_sell")
         )
-        
+
         if speed_confirms and imb.get("levels", 0) >= cfg["imbalance_min_stack"]:
-            sl_dist = current_price * cfg["stop_loss_pct"]
-            tp_dist = current_price * cfg["take_profit_1r"]
-            
+            sl_dist = current_price * stop_pct
+            tp_dist = current_price * tp_pct
+
             if direction == "long":
                 sl = current_price - sl_dist
                 tp = current_price + tp_dist * 2  # 2R
             else:
                 sl = current_price + sl_dist
                 tp = current_price - tp_dist * 2
-            
+
             signals.append(TradingSignal(
                 direction=direction,
                 source="stacked_imbalance",
@@ -166,10 +194,10 @@ def generate_signals(engine, trades, cfg):
                 take_profit=tp,
                 reason=f"堆叠{imb['levels']}层{'买' if direction=='long' else '卖'}方失衡 + 速度{'加速' if speed_confirms else ''}"
             ))
-    
+
     # ---- 信号 2: 吸收反转 ----
     abs_signals = [s for s in all_signals if s.get("source") == "absorption"]
-    
+
     for ab in abs_signals:
         # 吸收出现在关键价位附近
         near_key_level = (
@@ -177,19 +205,19 @@ def generate_signals(engine, trades, cfg):
             abs(current_price - vah) / vah < 0.002 or
             abs(current_price - val) / val < 0.002
         )
-        
+
         if near_key_level:
             direction = "long" if ab["direction"] == "seller_absorption" else "short"
-            sl_dist = current_price * cfg["stop_loss_pct"]
-            tp_dist = current_price * cfg["take_profit_1r"]
-            
+            sl_dist = current_price * stop_pct
+            tp_dist = current_price * tp_pct
+
             if direction == "long":
                 sl = current_price - sl_dist
                 tp = poc if poc > current_price else current_price + tp_dist * 2
             else:
                 sl = current_price + sl_dist
                 tp = poc if poc < current_price else current_price - tp_dist * 2
-            
+
             signals.append(TradingSignal(
                 direction=direction,
                 source="absorption",
@@ -199,29 +227,29 @@ def generate_signals(engine, trades, cfg):
                 take_profit=tp,
                 reason=f"吸收事件: Z={ab.get('z_score', 0):.1f}, 失衡={ab.get('net_imbalance', 0):.0%}, 价格不动"
             ))
-    
+
     # ---- 信号 3: CVD 背离 + 衰竭 ----
     div = engine.delta.get_divergence(lookback=10)
     exh_signals = [s for s in all_signals if s.get("source") == "exhaustion"]
-    
+
     if div != "none":
         # 背离 + 在关键价位
         near_va = (
             abs(current_price - vah) / vah < 0.003 or
             abs(current_price - val) / val < 0.003
         )
-        
+
         if near_va:
             direction = "long" if div == "bullish_div" else "short"
-            sl_dist = current_price * cfg["stop_loss_pct"]
-            
+            sl_dist = current_price * stop_pct
+
             if direction == "long":
                 sl = current_price - sl_dist
                 tp = poc  # 回归 POC
             else:
                 sl = current_price + sl_dist
                 tp = poc
-            
+
             signals.append(TradingSignal(
                 direction=direction,
                 source="cvd_divergence",
@@ -231,15 +259,12 @@ def generate_signals(engine, trades, cfg):
                 take_profit=tp,
                 reason=f"CVD {'看涨' if direction=='long' else '看跌'}背离 + VA附近"
             ))
-    
+
     # ---- 信号 4: 大户吸收 + 价值区边缘 ----
-    # 价格在 VAL 附近 + 卖方被吸收 → 做多
-    # 价格在 VAH 附近 + 买方被吸收 → 做空
     if val and abs(current_price - val) / val < 0.002:
         sell_pressure = sum(1 for s in all_signals if s.get("bias") == "bearish")
         if sell_pressure >= 2 and consensus != "bearish":
-            # 卖压大但价格没跌 → 买方在吸收
-            sl = current_price - current_price * cfg["stop_loss_pct"]
+            sl = current_price - current_price * stop_pct
             tp = poc
             signals.append(TradingSignal(
                 direction="long",
@@ -250,11 +275,11 @@ def generate_signals(engine, trades, cfg):
                 take_profit=tp,
                 reason=f"VAL({val:.0f})附近卖压被吸收"
             ))
-    
+
     if vah and abs(current_price - vah) / vah < 0.002:
         buy_pressure = sum(1 for s in all_signals if s.get("bias") == "bullish")
         if buy_pressure >= 2 and consensus != "bullish":
-            sl = current_price + current_price * cfg["stop_loss_pct"]
+            sl = current_price + current_price * stop_pct
             tp = poc
             signals.append(TradingSignal(
                 direction="short",
@@ -265,7 +290,20 @@ def generate_signals(engine, trades, cfg):
                 take_profit=tp,
                 reason=f"VAH({vah:.0f})附近买压被吸收"
             ))
-    
+
+    # ---- 信号 5: 订单簿失衡确认（增强模块）----
+    if enhanced_result and cfg.get("use_book_imbalance"):
+        book = enhanced_result.get("book", {})
+        book_bias = book.get("bias", "neutral")
+        if book_bias != "neutral":
+            direction = "long" if book_bias == "bullish" else "short"
+            # 订单簿信号只作为已有信号的确认，不独立产生入场信号
+            # 但可以提升已有信号的置信度
+            for s in signals:
+                if s.direction == direction:
+                    s.confidence = min(0.95, s.confidence + 0.1)
+                    s.reason += f" + DOM{'买方' if direction=='long' else '卖方'}支撑"
+
     return signals
 
 # ==================== 风控检查 ====================
@@ -307,46 +345,75 @@ def risk_check(state, cfg):
 # ==================== 策略主循环 ====================
 
 def run_strategy(dry_run=False):
-    """运行策略"""
+    """运行策略（增强版）"""
     cfg = CONFIG
     state = load_state()
-    
-    print(f"{'🧪 干跑模式' if dry_run else '🚀 实盘模式'}")
-    print(f"标的: {cfg['symbol']}  本金: 100 USDT  杠杆: 3x")
-    print(f"仓位: {cfg['default_qty']} BTC  止损: {cfg['stop_loss_pct']*100:.2f}%")
-    print(f"{'='*50}")
-    
+
     # 初始化引擎
-    engine = OrderFlowSignalEngine(tick_size=cfg["tick_size"])
-    
+    if cfg.get("use_enhanced_engine"):
+        engine = EnhancedSignalEngine(tick_size=cfg["tick_size"])
+        print(f"{'🧪 干跑模式' if dry_run else '🚀 实盘模式'} (增强版引擎)")
+    else:
+        engine = OrderFlowSignalEngine(tick_size=cfg["tick_size"])
+        print(f"{'🧪 干跑模式' if dry_run else '🚀 实盘模式'} (基础引擎)")
+
+    # 初始化交易日志
+    journal = TradeJournal() if cfg.get("use_enhanced_engine") else None
+
+    # 初始化动态仓位管理
+    sizer = DynamicPositionSizer(
+        account_balance=cfg["account_balance"],
+        risk_per_trade=cfg["risk_per_trade"],
+        base_qty=cfg["default_qty"],
+        min_qty=cfg["min_qty"],
+        max_qty=cfg["max_qty"],
+        leverage=cfg["leverage"],
+    ) if cfg.get("use_dynamic_position") else None
+
+    print(f"标的: {cfg['symbol']}  本金: {cfg['account_balance']} USDT  杠杆: {cfg['leverage']}x")
+    print(f"仓位: {'动态' if sizer else cfg['default_qty']} BTC  止损: {'自适应' if cfg.get('use_adaptive_params') else str(cfg['stop_loss_pct']*100)+'%'}")
+    print(f"{'='*50}")
+
     cycle = 0
     while True:
         cycle += 1
         now = datetime.now(timezone.utc)
         print(f"\n--- 周期 {cycle} | {now.strftime('%H:%M:%S')} UTC ---")
-        
+
         try:
-            # 1. 采集数据（分页获取最近 5 分钟完整数据）
+            # 1. 采集数据
             trades = fetch_aggtrades_full(cfg["symbol"], minutes=5)
             if not trades:
                 print("  ⚠️ 无法获取数据")
                 time.sleep(30)
                 continue
-            
+
             # 2. 喂入引擎
             engine.feed(trades)
-            
-            # 3. 生成信号
-            signals = generate_signals(engine, trades, cfg)
-            
-            # 4. 风控检查
+
+            # 3. 运行分析
+            enhanced_result = None
+            if isinstance(engine, EnhancedSignalEngine):
+                depth_data = fetch_depth(cfg["symbol"]) if cfg.get("use_book_imbalance") else None
+                enhanced_result = engine.analyze_enhanced(trades, depth_data, cfg["symbol"])
+
+                # 打印市场状态
+                regime = enhanced_result["regime"]
+                mtf = enhanced_result["mtf"]
+                print(f"  📊 市场: {regime['regime']} ({regime['confidence']:.0%}) - {regime['details']}")
+                print(f"  📊 多时间框架: {mtf['details']}")
+                print(f"  📊 ATR: {enhanced_result['atr_pct']*100:.2f}%")
+
+            # 4. 生成信号
+            signals = generate_signals(engine, trades, cfg, enhanced_result)
+
+            # 5. 风控检查
             can_trade, reason = risk_check(state, cfg)
-            
-            # 5. 获取当前价格和持仓
+
+            # 6. 获取当前价格
             current_price = float(trades[-1]["p"])
-            positions = get_positions()
-            
-            # 6. 检查持仓止损/止盈
+
+            # 7. 检查持仓止损/止盈
             if state.get("open_position"):
                 pos = state["open_position"]
                 entry = pos["entry_price"]
@@ -354,38 +421,46 @@ def run_strategy(dry_run=False):
                 tp = pos["take_profit"]
                 direction = pos["direction"]
                 hold_time = (time.time() - pos["entry_time"]) / 60
-                
-                # 止损（服务端止损单已下，这里是兜底检测）
+
+                # 止损
                 if (direction == "long" and current_price <= sl) or \
                    (direction == "short" and current_price >= sl):
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
                     pnl_pct = pnl / entry * 100
                     print(f"  🔴 止损触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}%")
-                    
+
+                    if journal:
+                        trade_id = pos.get("trade_id", f"T{state['total_trades']}")
+                        journal.log_exit(trade_id, current_price, "stop_loss", pnl, pnl_pct, hold_time)
+
                     if not dry_run:
-                        cancel_all_orders(cfg["symbol"])  # 取消服务端挂单
+                        cancel_all_orders(cfg["symbol"])
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
-                    
+
                     state["daily_pnl"] += pnl_pct
                     state["consecutive_losses"] += 1
                     state["open_position"] = None
                     state["daily_trades"] += 1
                     save_state(state)
                     continue
-                
-                # 止盈（服务端止盈单已下，这里是兜底检测）
+
+                # 止盈
                 if (direction == "long" and current_price >= tp) or \
                    (direction == "short" and current_price <= tp):
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
                     pnl_pct = pnl / entry * 100
                     print(f"  🟢 止盈触发! 入场={entry:.1f} 现价={current_price:.1f} PnL={pnl_pct:+.2f}%")
-                    
+
+                    if journal:
+                        trade_id = pos.get("trade_id", f"T{state['total_trades']}")
+                        journal.log_exit(trade_id, current_price, "take_profit", pnl, pnl_pct, hold_time)
+
                     if not dry_run:
-                        cancel_all_orders(cfg["symbol"])  # 取消服务端挂单
+                        cancel_all_orders(cfg["symbol"])
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
-                    
+
                     state["daily_pnl"] += pnl_pct
                     state["consecutive_losses"] = 0
                     state["open_position"] = None
@@ -393,37 +468,40 @@ def run_strategy(dry_run=False):
                     state["total_wins"] += 1
                     save_state(state)
                     continue
-                
+
                 # 超时平仓
                 if hold_time > cfg["max_hold_minutes"]:
                     pnl = (current_price - entry) if direction == "long" else (entry - current_price)
                     pnl_pct = pnl / entry * 100
                     print(f"  ⏰ 超时平仓! 持仓 {hold_time:.0f} 分钟, PnL={pnl_pct:+.2f}%")
-                    
+
+                    if journal:
+                        trade_id = pos.get("trade_id", f"T{state['total_trades']}")
+                        journal.log_exit(trade_id, current_price, "timeout", pnl, pnl_pct, hold_time)
+
                     if not dry_run:
                         cancel_all_orders(cfg["symbol"])
                         close_side = "SELL" if direction == "long" else "BUY"
                         place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
-                    
+
                     state["daily_pnl"] += pnl_pct
                     state["open_position"] = None
                     state["daily_trades"] += 1
                     save_state(state)
                     continue
-                
-                # 移动止损（盈利 1R 后）
+
+                # 移动止损
                 if cfg["trailing_stop_1r"]:
                     risk = abs(entry - sl)
                     if direction == "long" and current_price >= entry + risk:
-                        new_sl = entry + risk * 0.5  # 移到成本 + 0.5R
+                        new_sl = entry + risk * 0.5
                         if new_sl > sl:
                             state["open_position"]["stop_loss"] = new_sl
                             print(f"  📍 移动止损到 {new_sl:.1f}")
-                            # 更新服务端止损单
                             if not dry_run:
                                 cancel_all_orders(cfg["symbol"])
                                 close_side = "SELL" if direction == "long" else "BUY"
-                                sl_order = place_stop_order(cfg["symbol"], close_side, new_sl, cfg["default_qty"])
+                                sl_order = place_stop_order(cfg["symbol"], close_side, new_sl, pos["qty"])
                                 if sl_order:
                                     state["open_position"]["sl_order_id"] = sl_order.get("orderId")
                             save_state(state)
@@ -432,69 +510,113 @@ def run_strategy(dry_run=False):
                         if new_sl < sl:
                             state["open_position"]["stop_loss"] = new_sl
                             print(f"  📍 移动止损到 {new_sl:.1f}")
-                            # 更新服务端止损单
                             if not dry_run:
                                 cancel_all_orders(cfg["symbol"])
                                 close_side = "SELL" if direction == "long" else "BUY"
-                                sl_order = place_stop_order(cfg["symbol"], close_side, new_sl, cfg["default_qty"])
+                                sl_order = place_stop_order(cfg["symbol"], close_side, new_sl, pos["qty"])
                                 if sl_order:
                                     state["open_position"]["sl_order_id"] = sl_order.get("orderId")
                             save_state(state)
-                
+
                 print(f"  📊 持仓中: {direction} @ {entry:.1f} | SL={state['open_position']['stop_loss']:.1f} TP={tp:.1f} | {hold_time:.0f}min")
-            
-            # 7. 寻找入场机会
+
+            # 8. 寻找入场机会
             elif signals and can_trade:
-                # 按置信度排序
                 signals.sort(key=lambda s: s.confidence, reverse=True)
                 best = signals[0]
-                
-                # 检查信号数量（至少 2 个一致方向）
+
+                # 获取自适应参数的最小信号数
+                min_signals = cfg["min_signal_agreement"]
+                if enhanced_result and cfg.get("use_adaptive_params"):
+                    min_signals = enhanced_result["adaptive_params"].get("min_signals", min_signals)
+
                 same_dir = [s for s in signals if s.direction == best.direction]
-                
-                if len(same_dir) >= cfg["min_signal_agreement"]:
+
+                if len(same_dir) >= min_signals:
+                    # 动态仓位计算
+                    qty = cfg["default_qty"]
+                    if sizer and cfg.get("use_dynamic_position"):
+                        regime = enhanced_result["regime"]["regime"] if enhanced_result else "ranging"
+                        qty_mult = enhanced_result["adaptive_params"]["qty_multiplier"] if enhanced_result else 1.0
+                        qty = sizer.calculate(
+                            entry_price=current_price,
+                            stop_loss_pct=cfg["stop_loss_pct"],
+                            signal_count=len(same_dir),
+                            regime=regime,
+                            qty_multiplier=qty_mult,
+                        )
+
                     print(f"  🎯 入场信号: {best.direction.upper()} @ {best.entry_price:.1f}")
                     print(f"     来源: {best.source} ({best.reason})")
                     print(f"     SL={best.stop_loss:.1f} TP={best.take_profit:.1f}")
-                    print(f"     一致性: {len(same_dir)} 个信号")
-                    
+                    print(f"     一致性: {len(same_dir)} 个信号  仓位: {qty} BTC")
+
+                    # 记录交易日志
+                    trade_id = f"T{state['total_trades'] + 1}"
+                    if journal:
+                        signal_details = [{"source": s.source, "direction": s.direction, "confidence": s.confidence} for s in same_dir]
+                        regime_info = enhanced_result["regime"] if enhanced_result else {"regime": "unknown"}
+                        journal.log_entry(
+                            trade_id=trade_id,
+                            direction=best.direction,
+                            entry_price=current_price,
+                            qty=qty,
+                            stop_loss=best.stop_loss,
+                            take_profit=best.take_profit,
+                            signals=signal_details,
+                            regime=regime_info,
+                            params=enhanced_result["adaptive_params"] if enhanced_result else {},
+                            reason=best.reason,
+                        )
+                        journal.log_signal_snapshot(
+                            trade_id=trade_id,
+                            price=current_price,
+                            cvd=engine.delta.cvd,
+                            delta=engine.delta.current_delta,
+                            poc=engine.volume_profile.get_poc(),
+                            vah=engine.volume_profile.get_value_area()[0],
+                            val=engine.volume_profile.get_value_area()[1],
+                            consensus=enhanced_result["consensus"] if enhanced_result else "unknown",
+                            signals=[s.source for s in same_dir],
+                        )
+
                     if not dry_run:
                         side = "BUY" if best.direction == "long" else "SELL"
-                        result = place_order(cfg["symbol"], side, "MARKET", cfg["default_qty"])
-                        
+                        result = place_order(cfg["symbol"], side, "MARKET", qty)
+
                         if result:
                             state["open_position"] = {
                                 "direction": best.direction,
                                 "entry_price": current_price,
                                 "stop_loss": best.stop_loss,
                                 "take_profit": best.take_profit,
-                                "qty": cfg["default_qty"],
+                                "qty": qty,
                                 "entry_time": time.time(),
                                 "source": best.source,
                                 "reason": best.reason,
+                                "trade_id": trade_id,
                             }
                             state["total_trades"] += 1
                             save_state(state)
-                            
-                            # 下服务端止损/止盈单（程序崩溃也能触发）
+
+                            # 下服务端止损/止盈单
                             close_side = "SELL" if best.direction == "long" else "BUY"
-                            sl_order = place_stop_order(cfg["symbol"], close_side, best.stop_loss, cfg["default_qty"])
-                            tp_order = place_take_profit_order(cfg["symbol"], close_side, best.take_profit, cfg["default_qty"])
+                            sl_order = place_stop_order(cfg["symbol"], close_side, best.stop_loss, qty)
+                            tp_order = place_take_profit_order(cfg["symbol"], close_side, best.take_profit, qty)
                             if sl_order:
                                 state["open_position"]["sl_order_id"] = sl_order.get("orderId")
                             if tp_order:
                                 state["open_position"]["tp_order_id"] = tp_order.get("orderId")
                             save_state(state)
-                            
+
                             print(f"  ✅ 开仓成功! 止损/止盈单已下到服务端")
                 else:
-                    print(f"  ⏳ 信号不够一致 ({len(same_dir)}/{cfg['min_signal_agreement']})")
-            
+                    print(f"  ⏳ 信号不够一致 ({len(same_dir)}/{min_signals})")
+
             elif not can_trade:
                 print(f"  🚫 无法交易: {reason}")
-            
+
             else:
-                # 打印当前状态
                 consensus, conf = engine.get_consensus()
                 vah, val, poc = engine.volume_profile.get_value_area()
                 print(f"  价格: {current_price:.1f} | 共识: {consensus} ({conf:.0%})")
@@ -503,21 +625,27 @@ def run_strategy(dry_run=False):
                 if signals:
                     print(f"  信号: {', '.join(s.source for s in signals)}")
                 print(f"  等待入场...")
-            
+
             # 打印信号摘要
             if signals:
                 print(f"\n  📋 活跃信号:")
                 for s in signals:
                     icon = "🟢" if s.direction == "long" else "🔴"
                     print(f"    {icon} {s.source}: {s.direction} ({s.confidence:.0%}) - {s.reason}")
-        
+
+            # 打印交易统计（如果有日志）
+            if journal and cycle % 10 == 0:
+                stats = journal.get_stats()
+                if stats["total"] > 0:
+                    print(f"\n  📈 交易统计: 胜率={stats['win_rate']:.0%} 总交易={stats['total']} 总PnL={stats['total_pnl']:+.2f}%")
+
         except Exception as e:
             print(f"  ❌ 错误: {e}")
             import traceback
             traceback.print_exc()
-        
+
         # 等待下一个周期
-        time.sleep(30)  # 30 秒刷新
+        time.sleep(30)
 
 # ==================== 入口 ====================
 

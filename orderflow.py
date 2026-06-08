@@ -14,8 +14,19 @@ ATAS 核心功能的 Python 实现，用于币安合约模拟盘
 7. Iceberg Detection - 冰山单检测
 8. Speed of Tape - 成交速度/动量
 9. Trading Signals - 自动信号生成
+
+增强模块:
+10. MarketRegimeDetector - 市场状态识别（trending/ranging/breakout）
+11. ATRCalculator - ATR 波动率计算
+12. BookImbalance - 订单簿失衡检测
+13. MultiTimeframeConfirm - 多时间框架确认
+14. OIFundingAnalyzer - OI + 资金费率分析
+15. AdaptiveParams - 自适应参数（基于 ATR）
+16. DynamicPositionSizer - 动态仓位管理
+17. TradeJournal - 交易日志系统
 """
 
+import os
 import time
 import math
 import requests
@@ -1206,6 +1217,873 @@ class OrderFlowSignalEngine:
             print(f"     VAL: {val:.1f} (价值区下沿)")
         
         return consensus, confidence
+
+
+# ==================== 10. 市场状态识别 (Market Regime Detection) ====================
+
+class MarketRegimeDetector:
+    """
+    市场状态识别
+
+    判断当前市场处于哪种状态，不同状态使用不同策略：
+    - trending_up: 上升趋势，跟随做多信号
+    - trending_down: 下降趋势，跟随做空信号
+    - ranging: 震荡，在 VAH/VAL 做均值回归
+    - breakout: 突破，等待量能确认
+    - low_volatility: 低波动，不交易
+
+    检测方法:
+    1. ATR 波动率 vs 历史均值
+    2. 价格与 VA 的关系
+    3. CVD 趋势方向
+    4. Delta 一致性（连续 N 个周期同方向）
+    """
+
+    REGIME_TRENDING_UP = "trending_up"
+    REGIME_TRENDING_DOWN = "trending_down"
+    REGIME_RANGING = "ranging"
+    REGIME_BREAKOUT = "breakout"
+    REGIME_LOW_VOL = "low_volatility"
+
+    def __init__(self):
+        self.atr_history = deque(maxlen=50)
+        self.regime_history = deque(maxlen=20)
+
+    def detect(self, delta_history, volume_profile, current_price, trades):
+        """
+        检测当前市场状态
+
+        Args:
+            delta_history: DeltaTracker.history
+            volume_profile: VolumeProfile 对象
+            current_price: 当前价格
+            trades: 最近的 aggTrades
+
+        Returns:
+            dict: {regime, confidence, atr_ratio, delta_consistency, details}
+        """
+        result = {
+            "regime": self.REGIME_RANGING,
+            "confidence": 0.5,
+            "atr_ratio": 1.0,
+            "delta_consistency": 0,
+            "details": "",
+        }
+
+        # 1. ATR 波动率分析
+        atr, atr_ratio = self._calc_atr_ratio(delta_history)
+        result["atr_ratio"] = atr_ratio
+
+        # 2. 价格与 VA 关系
+        vah, val, poc = volume_profile.get_value_area()
+        if not poc:
+            return result
+
+        price_vs_poc = (current_price - poc) / poc if poc else 0
+        va_width = (vah - val) / poc if poc and vah and val else 0
+
+        # 3. Delta 一致性（最近 5 个周期）
+        consistency = self._calc_delta_consistency(delta_history)
+        result["delta_consistency"] = consistency
+
+        # 4. 综合判断
+        # 低波动
+        if atr_ratio < 0.5:
+            result["regime"] = self.REGIME_LOW_VOL
+            result["confidence"] = 0.7
+            result["details"] = f"ATR 仅为均值 {atr_ratio:.0%}，波动率过低"
+            self.regime_history.append(result["regime"])
+            return result
+
+        # 突破：价格离开 VA + 高波动 + Delta 一致
+        if va_width > 0 and current_price > vah and atr_ratio > 1.2 and consistency > 0.6:
+            result["regime"] = self.REGIME_BREAKOUT
+            result["confidence"] = min(0.9, 0.6 + consistency * 0.3)
+            result["details"] = f"价格突破 VAH({vah:.0f})，ATR={atr_ratio:.1f}x，Delta一致性={consistency:.0%}"
+            self.regime_history.append(result["regime"])
+            return result
+
+        if va_width > 0 and current_price < val and atr_ratio > 1.2 and consistency < -0.6:
+            result["regime"] = self.REGIME_BREAKOUT
+            result["confidence"] = min(0.9, 0.6 + abs(consistency) * 0.3)
+            result["details"] = f"价格跌破 VAL({val:.0f})，ATR={atr_ratio:.1f}x，Delta一致性={consistency:.0%}"
+            self.regime_history.append(result["regime"])
+            return result
+
+        # 趋势：Delta 一致 + 价格偏向一侧
+        if consistency > 0.6 and price_vs_poc > 0.001:
+            result["regime"] = self.REGIME_TRENDING_UP
+            result["confidence"] = min(0.85, 0.5 + consistency * 0.3)
+            result["details"] = f"CVD 连续看多，价格在 POC 上方 {price_vs_poc:.2%}"
+            self.regime_history.append(result["regime"])
+            return result
+
+        if consistency < -0.6 and price_vs_poc < -0.001:
+            result["regime"] = self.REGIME_TRENDING_DOWN
+            result["confidence"] = min(0.85, 0.5 + abs(consistency) * 0.3)
+            result["details"] = f"CVD 连续看空，价格在 POC 下方 {abs(price_vs_poc):.2%}"
+            self.regime_history.append(result["regime"])
+            return result
+
+        # 震荡（默认）
+        result["regime"] = self.REGIME_RANGING
+        result["confidence"] = 0.5
+        result["details"] = f"价格在 VA 内，无明确方向，ATR={atr_ratio:.1f}x"
+        self.regime_history.append(result["regime"])
+        return result
+
+    def _calc_atr_ratio(self, delta_history):
+        """计算当前 ATR 相对于历史均值的比率"""
+        if len(delta_history) < 10:
+            return 0, 1.0
+
+        # 用 delta_history 的价格计算简易 ATR（真实波幅）
+        trs = []
+        for i in range(1, len(delta_history)):
+            high = max(delta_history[i]["price"], delta_history[i-1]["price"])
+            low = min(delta_history[i]["price"], delta_history[i-1]["price"])
+            trs.append(high - low)
+
+        if len(trs) < 5:
+            return 0, 1.0
+
+        current_atr = sum(trs[-5:]) / 5
+        historical_atr = sum(trs) / len(trs)
+
+        self.atr_history.append(current_atr)
+
+        atr_ratio = current_atr / historical_atr if historical_atr > 0 else 1.0
+        return current_atr, atr_ratio
+
+    def _calc_delta_consistency(self, delta_history):
+        """
+        计算最近 N 个周期 Delta 方向一致性
+
+        Returns:
+            float: -1 到 1，正=多头一致，负=空头一致，0=无一致
+        """
+        if len(delta_history) < 5:
+            return 0
+
+        recent = delta_history[-5:]
+        bullish = sum(1 for h in recent if h["delta"] > 0)
+        bearish = sum(1 for h in recent if h["delta"] < 0)
+
+        return (bullish - bearish) / len(recent)
+
+
+# ==================== 11. ATR 计算器 ====================
+
+class ATRCalculator:
+    """
+    ATR (Average True Range) 波动率计算
+
+    用于:
+    - 动态止损距离
+    - 自适应信号阈值
+    - 仓位大小调整
+    """
+
+    def __init__(self, period=14):
+        self.period = period
+        self.tr_history = deque(maxlen=200)
+
+    def update(self, trades, bar_seconds=300):
+        """从成交数据计算 ATR"""
+        if len(trades) < 2:
+            return
+
+        # 按 K 线分组
+        bars = defaultdict(list)
+        for t in trades:
+            bar_key = int(t["T"] / 1000 / bar_seconds) * bar_seconds
+            bars[bar_key].append(float(t["p"]))
+
+        if len(bars) < 2:
+            return
+
+        sorted_bars = sorted(bars.items())
+        for i in range(1, len(sorted_bars)):
+            prev_prices = sorted_bars[i-1][1]
+            curr_prices = sorted_bars[i][1]
+
+            high = max(curr_prices)
+            low = min(curr_prices)
+            prev_close = prev_prices[-1]
+
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            self.tr_history.append(tr)
+
+    def get_atr(self):
+        """获取当前 ATR"""
+        if len(self.tr_history) < self.period:
+            return None
+        recent = list(self.tr_history)[-self.period:]
+        return sum(recent) / len(recent)
+
+    def get_atr_pct(self, current_price):
+        """获取 ATR 占价格的百分比"""
+        atr = self.get_atr()
+        if atr and current_price > 0:
+            return atr / current_price
+        return 0.005  # 默认 0.5%
+
+
+# ==================== 12. 订单簿失衡 (Book Imbalance) ====================
+
+class BookImbalance:
+    """
+    订单簿失衡检测
+
+    原理:
+    - DOM (Depth of Market) 的 bid/ask 比率反映买卖力量对比
+    - bid_vol / ask_vol > 1.5 → 买方支撑强 → 看涨
+    - bid_vol / ask_vol < 0.67 → 卖方压力大 → 看跌
+
+    用途:
+    - 作为订单流信号的确认指标
+    - 与吸收/失衡信号结合使用
+    """
+
+    def __init__(self, bullish_threshold=1.5, bearish_threshold=0.67):
+        self.bullish_threshold = bullish_threshold
+        self.bearish_threshold = bearish_threshold
+
+    def analyze(self, depth_data):
+        """
+        分析订单簿失衡
+
+        Args:
+            depth_data: fetch_depth() 返回的数据 {"bids": [...], "asks": [...]}
+
+        Returns:
+            dict: {ratio, bias, bid_vol, ask_vol, bid_wall, ask_wall}
+        """
+        if not depth_data:
+            return {"ratio": 1.0, "bias": "neutral", "bid_vol": 0, "ask_vol": 0,
+                    "bid_wall": None, "ask_wall": None}
+
+        bids = depth_data.get("bids", [])
+        asks = depth_data.get("asks", [])
+
+        if not bids or not asks:
+            return {"ratio": 1.0, "bias": "neutral", "bid_vol": 0, "ask_vol": 0,
+                    "bid_wall": None, "ask_wall": None}
+
+        bid_vol = sum(float(b[1]) for b in bids)
+        ask_vol = sum(float(a[1]) for a in asks)
+
+        ratio = bid_vol / ask_vol if ask_vol > 0 else 2.0
+
+        if ratio >= self.bullish_threshold:
+            bias = "bullish"
+        elif ratio <= self.bearish_threshold:
+            bias = "bearish"
+        else:
+            bias = "neutral"
+
+        # 找最大挂单墙
+        bid_wall = max(bids, key=lambda x: float(x[1])) if bids else None
+        ask_wall = max(asks, key=lambda x: float(x[1])) if asks else None
+
+        return {
+            "ratio": ratio,
+            "bias": bias,
+            "bid_vol": bid_vol,
+            "ask_vol": ask_vol,
+            "bid_wall": float(bid_wall[0]) if bid_wall else None,
+            "bid_wall_vol": float(bid_wall[1]) if bid_wall else 0,
+            "ask_wall": float(ask_wall[0]) if ask_wall else None,
+            "ask_wall_vol": float(ask_wall[1]) if ask_wall else 0,
+        }
+
+
+# ==================== 13. 多时间框架确认 (Multi-Timeframe Confirmation) ====================
+
+class MultiTimeframeConfirm:
+    """
+    多时间框架确认
+
+    原理:
+    - 对比不同时间窗口的 Volume Profile 和 Delta 方向
+    - 短周期信号 + 长周期同方向确认 = 更高胜率
+    - 短周期做多但长周期空头主导 → 信号可能不可靠
+
+    实现:
+    - 使用同一份 aggTrade 数据，按不同窗口大小聚合
+    - 对比 1min / 5min / 15min 的 Delta 和 VP
+    """
+
+    def __init__(self):
+        self.timeframes = {
+            "1m": {"delta": 0, "bias": "neutral"},
+            "5m": {"delta": 0, "bias": "neutral"},
+            "15m": {"delta": 0, "bias": "neutral"},
+        }
+
+    def analyze(self, trades):
+        """
+        多时间框架分析
+
+        Args:
+            trades: aggTrades 列表
+
+        Returns:
+            dict: {agreement, bias, details, score}
+        """
+        if not trades or len(trades) < 100:
+            return {"agreement": 0, "bias": "neutral", "details": "数据不足", "score": 0}
+
+        # 按不同时间窗口计算 Delta
+        results = {}
+        for tf_name, tf_seconds in [("1m", 60), ("5m", 300), ("15m", 900)]:
+            delta = self._calc_delta_by_window(trades, tf_seconds)
+            bias = "bullish" if delta > 0 else "bearish" if delta < 0 else "neutral"
+            results[tf_name] = {"delta": delta, "bias": bias}
+
+        self.timeframes = results
+
+        # 计算一致性
+        biases = [v["bias"] for v in results.values()]
+        bullish_count = sum(1 for b in biases if b == "bullish")
+        bearish_count = sum(1 for b in biases if b == "bearish")
+
+        if bullish_count == 3:
+            return {"agreement": 1.0, "bias": "bullish",
+                    "details": "1m/5m/15m 全部看多", "score": 3}
+        elif bearish_count == 3:
+            return {"agreement": 1.0, "bias": "bearish",
+                    "details": "1m/5m/15m 全部看空", "score": -3}
+        elif bullish_count == 2:
+            return {"agreement": 0.67, "bias": "bullish",
+                    "details": f"2/3 时间框架看多 ({', '.join(tf for tf, v in results.items() if v['bias']=='bullish')})",
+                    "score": 1}
+        elif bearish_count == 2:
+            return {"agreement": 0.67, "bias": "bearish",
+                    "details": f"2/3 时间框架看空 ({', '.join(tf for tf, v in results.items() if v['bias']=='bearish')})",
+                    "score": -1}
+        else:
+            return {"agreement": 0, "bias": "neutral",
+                    "details": "时间框架方向不一致", "score": 0}
+
+    def _calc_delta_by_window(self, trades, window_seconds):
+        """按指定窗口计算总 Delta"""
+        buy_vol = 0.0
+        sell_vol = 0.0
+
+        # 只取最近 N 个窗口的数据
+        now = trades[-1]["T"] / 1000
+        cutoff = now - window_seconds * 5  # 最近 5 个窗口
+
+        for t in trades:
+            ts = t["T"] / 1000
+            if ts < cutoff:
+                continue
+            qty = float(t["q"])
+            if t["m"]:
+                sell_vol += qty
+            else:
+                buy_vol += qty
+
+        return buy_vol - sell_vol
+
+
+# ==================== 14. OI + 资金费率分析 ====================
+
+class OIFundingAnalyzer:
+    """
+    持仓量 (OI) + 资金费率分析
+
+    信号逻辑:
+    - OI 增 + 价格涨 → 新多头入场，趋势健康 (bullish)
+    - OI 减 + 价格涨 → 空头平仓，反弹可能结束 (bearish)
+    - OI 增 + 价格跌 → 新空头入场，下跌趋势 (bearish)
+    - OI 减 + 价格跌 → 多头平仓，抛压减弱 (bullish)
+    - 资金费率 > 0.1% → 多头过热，逆向看空
+    - 资金费率 < -0.1% → 空头过热，逆向看多
+    """
+
+    def __init__(self, api_mode="futures_demo"):
+        self.api_mode = api_mode
+        self.funding_extreme_threshold = 0.001  # 0.1%
+
+    def analyze(self, symbol="BTCUSDT"):
+        """
+        获取并分析 OI 和资金费率
+
+        Returns:
+            dict: {oi_change, funding_rate, bias, confidence, details}
+        """
+        result = {
+            "oi_change": 0,
+            "funding_rate": 0,
+            "bias": "neutral",
+            "confidence": 0,
+            "details": "",
+        }
+
+        try:
+            from config import FUTURES_DEMO_BASE
+            base = FUTURES_DEMO_BASE
+        except ImportError:
+            return result
+
+        # 获取资金费率
+        try:
+            proxies = get_proxies()
+            r = requests.get(f"{base}/fapi/v1/premiumIndex",
+                           params={"symbol": symbol},
+                           proxies=proxies, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                result["funding_rate"] = float(data.get("lastFundingRate", 0))
+        except Exception:
+            pass
+
+        # 获取 OI 历史
+        try:
+            r = requests.get("https://fapi.binance.com/futures/data/openInterestHist",
+                           params={"symbol": symbol, "period": "1h", "limit": 5},
+                           proxies=proxies, timeout=10)
+            if r.status_code == 200 and isinstance(r.json(), list) and len(r.json()) >= 2:
+                oi_data = r.json()
+                oi_first = float(oi_data[0]["sumOpenInterest"])
+                oi_last = float(oi_data[-1]["sumOpenInterest"])
+                if oi_first > 0:
+                    result["oi_change"] = (oi_last - oi_first) / oi_first
+        except Exception:
+            pass
+
+        # 综合判断
+        funding = result["funding_rate"]
+        oi_chg = result["oi_change"]
+
+        signals = []
+
+        # 资金费率极端
+        if funding > self.funding_extreme_threshold:
+            signals.append(("bearish", 0.6, f"资金费率 {funding*100:.3f}% 过高，多头过热"))
+        elif funding < -self.funding_extreme_threshold:
+            signals.append(("bullish", 0.6, f"资金费率 {funding*100:.3f}% 过低，空头过热"))
+
+        # OI 变化（需要配合价格方向，这里简化处理）
+        if abs(oi_chg) > 0.02:  # OI 变化超过 2%
+            if oi_chg > 0:
+                signals.append(("bullish", 0.4, f"OI 增加 {oi_chg:.1%}，新资金入场"))
+            else:
+                signals.append(("bearish", 0.4, f"OI 减少 {abs(oi_chg):.1%}，资金撤离"))
+
+        if signals:
+            # 取最强信号
+            best = max(signals, key=lambda x: x[1])
+            result["bias"] = best[0]
+            result["confidence"] = best[1]
+            result["details"] = best[2]
+        else:
+            result["details"] = f"资金费率={funding*100:.3f}%, OI变化={oi_chg:.1%}"
+
+        return result
+
+
+# ==================== 15. 自适应参数 (Adaptive Parameters) ====================
+
+class AdaptiveParams:
+    """
+    基于 ATR 的自适应参数
+
+    根据市场波动率动态调整:
+    - 止损距离: 高波动放宽，低波动收紧
+    - 信号阈值: 高波动要求更强信号
+    - 仓位大小: 高波动减仓，低波动加仓
+    """
+
+    def __init__(self, base_stop_pct=0.0065, base_tp_pct=0.013):
+        self.base_stop_pct = base_stop_pct
+        self.base_tp_pct = base_tp_pct
+
+    def get_params(self, atr_pct, regime):
+        """
+        根据 ATR 和市场状态返回自适应参数
+
+        Args:
+            atr_pct: ATR 占价格的百分比
+            regime: 市场状态字符串
+
+        Returns:
+            dict: {stop_loss_pct, take_profit_pct, min_signals, qty_multiplier}
+        """
+        # ATR 基础调整
+        # 用 ATR 的 1.5 倍作为止损
+        atr_stop = max(0.003, min(0.015, atr_pct * 1.5))
+        atr_tp = atr_stop * 2  # 2:1 R:R
+
+        # 市场状态调整
+        regime_multipliers = {
+            MarketRegimeDetector.REGIME_TRENDING_UP: {"stop": 1.0, "tp": 1.2, "sig": 1, "qty": 1.0},
+            MarketRegimeDetector.REGIME_TRENDING_DOWN: {"stop": 1.0, "tp": 1.2, "sig": 1, "qty": 1.0},
+            MarketRegimeDetector.REGIME_RANGING: {"stop": 0.8, "tp": 0.8, "sig": 2, "qty": 0.8},
+            MarketRegimeDetector.REGIME_BREAKOUT: {"stop": 1.2, "tp": 1.5, "sig": 1, "qty": 1.0},
+            MarketRegimeDetector.REGIME_LOW_VOL: {"stop": 0.6, "tp": 0.6, "sig": 3, "qty": 0.5},
+        }
+
+        mult = regime_multipliers.get(regime, regime_multipliers[MarketRegimeDetector.REGIME_RANGING])
+
+        return {
+            "stop_loss_pct": atr_stop * mult["stop"],
+            "take_profit_pct": atr_tp * mult["tp"],
+            "min_signals": max(2, mult["sig"]),
+            "qty_multiplier": mult["qty"],
+        }
+
+
+# ==================== 16. 动态仓位管理 (Dynamic Position Sizer) ====================
+
+class DynamicPositionSizer:
+    """
+    动态仓位管理
+
+    根据以下因素动态调整仓位:
+    1. 信号强度（一致信号数量）
+    2. 市场状态（趋势/震荡/突破）
+    3. ATR 波动率
+    4. 账户风险比例
+
+    公式:
+    qty = (account_balance * risk_per_trade) / (entry_price * stop_loss_pct)
+    然后根据信号强度和市场状态调整
+    """
+
+    def __init__(self, account_balance=100, risk_per_trade=0.02,
+                 base_qty=0.005, min_qty=0.001, max_qty=0.01,
+                 leverage=3):
+        self.account_balance = account_balance
+        self.risk_per_trade = risk_per_trade
+        self.base_qty = base_qty
+        self.min_qty = min_qty
+        self.max_qty = max_qty
+        self.leverage = leverage
+
+    def calculate(self, entry_price, stop_loss_pct, signal_count,
+                  regime, qty_multiplier=1.0):
+        """
+        计算仓位大小
+
+        Args:
+            entry_price: 入场价格
+            stop_loss_pct: 止损百分比
+            signal_count: 同方向信号数量
+            regime: 市场状态
+            qty_multiplier: 自适应参数的仓位系数
+
+        Returns:
+            float: 仓位大小 (BTC)
+        """
+        if entry_price <= 0 or stop_loss_pct <= 0:
+            return self.min_qty
+
+        # 基础风控仓位: 限制单笔亏损在 risk_per_trade 以内
+        risk_amount = self.account_balance * self.risk_per_trade * self.leverage
+        risk_per_unit = entry_price * stop_loss_pct
+        risk_qty = risk_amount / risk_per_unit if risk_per_unit > 0 else self.base_qty
+
+        # 信号强度调整
+        signal_mult = {
+            1: 0.5,   # 1 个信号 → 半仓
+            2: 0.8,   # 2 个信号 → 八成仓
+            3: 1.0,   # 3 个信号 → 满仓
+            4: 1.2,   # 4+ 信号 → 超配
+        }
+        sig_mult = signal_mult.get(min(signal_count, 4), 1.0)
+
+        # 突破状态可以适当加仓
+        regime_mult = {
+            MarketRegimeDetector.REGIME_TRENDING_UP: 1.0,
+            MarketRegimeDetector.REGIME_TRENDING_DOWN: 1.0,
+            MarketRegimeDetector.REGIME_RANGING: 0.8,
+            MarketRegimeDetector.REGIME_BREAKOUT: 1.2,
+            MarketRegimeDetector.REGIME_LOW_VOL: 0.5,
+        }
+        r_mult = regime_mult.get(regime, 1.0)
+
+        # 综合计算
+        qty = self.base_qty * sig_mult * r_mult * qty_multiplier
+
+        # 风控上限
+        qty = min(qty, risk_qty)
+
+        # 硬性限制
+        qty = max(self.min_qty, min(self.max_qty, round(qty, 4)))
+
+        return qty
+
+
+# ==================== 17. 交易日志系统 (Trade Journal) ====================
+
+class TradeJournal:
+    """
+    交易日志系统
+
+    记录每笔交易的完整上下文:
+    - 入场时的所有信号值
+    - 市场状态
+    - 仓位计算依据
+    - 入场后的价格路径
+    - 出场原因和 PnL
+
+    用途:
+    - 复盘分析
+    - 参数优化
+    - 胜率统计
+    """
+
+    def __init__(self, journal_file=None):
+        self.journal_file = journal_file or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "trade_journal.jsonl"
+        )
+
+    def log_entry(self, trade_id, direction, entry_price, qty,
+                  stop_loss, take_profit, signals, regime, params, reason):
+        """记录入场"""
+        import json
+
+        record = {
+            "type": "entry",
+            "trade_id": trade_id,
+            "timestamp": time.time(),
+            "time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "direction": direction,
+            "entry_price": entry_price,
+            "qty": qty,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "signals": signals,
+            "regime": regime,
+            "params": params,
+            "reason": reason,
+        }
+
+        self._append(record)
+
+    def log_exit(self, trade_id, exit_price, exit_reason, pnl, pnl_pct, hold_time):
+        """记录出场"""
+        import json
+
+        record = {
+            "type": "exit",
+            "trade_id": trade_id,
+            "timestamp": time.time(),
+            "time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "exit_price": exit_price,
+            "exit_reason": exit_reason,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "hold_time_minutes": hold_time,
+        }
+
+        self._append(record)
+
+    def log_signal_snapshot(self, trade_id, price, cvd, delta, poc, vah, val,
+                           consensus, signals):
+        """记录信号快照（入场时的市场状态）"""
+        record = {
+            "type": "snapshot",
+            "trade_id": trade_id,
+            "timestamp": time.time(),
+            "price": price,
+            "cvd": cvd,
+            "delta": delta,
+            "poc": poc,
+            "vah": vah,
+            "val": val,
+            "consensus": consensus,
+            "active_signals": signals,
+        }
+
+        self._append(record)
+
+    def get_stats(self, last_n=50):
+        """获取交易统计"""
+        trades = self._load_entries_and_exits()
+        if not trades:
+            return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0, "avg_pnl": 0}
+
+        completed = [t for t in trades if t.get("type") == "exit"]
+        if not completed:
+            return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0, "avg_pnl": 0}
+
+        recent = completed[-last_n:]
+        wins = sum(1 for t in recent if t.get("pnl", 0) > 0)
+        losses = sum(1 for t in recent if t.get("pnl", 0) <= 0)
+        total_pnl = sum(t.get("pnl", 0) for t in recent)
+        avg_pnl = total_pnl / len(recent) if recent else 0
+
+        return {
+            "total": len(recent),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": wins / len(recent) if recent else 0,
+            "avg_pnl": avg_pnl,
+            "total_pnl": total_pnl,
+        }
+
+    def _append(self, record):
+        """追加记录到文件"""
+        import json
+        try:
+            with open(self.journal_file, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"⚠️ 日志写入失败: {e}")
+
+    def _load_entries_and_exits(self):
+        """加载所有入场和出场记录"""
+        import json
+        records = []
+        try:
+            with open(self.journal_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+        except FileNotFoundError:
+            pass
+        return [r for r in records if r.get("type") in ("entry", "exit")]
+
+
+# ==================== 增强版信号引擎 ====================
+
+class EnhancedSignalEngine(OrderFlowSignalEngine):
+    """
+    增强版信号引擎
+
+    在基础引擎之上集成:
+    - 市场状态识别
+    - ATR 波动率
+    - 订单簿失衡
+    - 多时间框架确认
+    - OI + 资金费率
+    - 自适应参数
+    - 动态仓位
+    """
+
+    def __init__(self, tick_size=0.1):
+        super().__init__(tick_size)
+
+        # 新增模块
+        self.regime_detector = MarketRegimeDetector()
+        self.atr = ATRCalculator()
+        self.book_imbalance = BookImbalance()
+        self.mtf = MultiTimeframeConfirm()
+        self.oi_funding = OIFundingAnalyzer()
+        self.adaptive = AdaptiveParams()
+        self.position_sizer = DynamicPositionSizer()
+        self.journal = TradeJournal()
+
+        # 缓存
+        self._regime_cache = None
+        self._mtf_cache = None
+        self._book_cache = None
+
+    def feed(self, trades):
+        """喂入数据，更新所有指标包括新增模块"""
+        super().feed(trades)
+        self.atr.update(trades)
+
+    def analyze_enhanced(self, trades, depth_data=None, symbol="BTCUSDT"):
+        """
+        运行增强版分析
+
+        Args:
+            trades: aggTrades
+            depth_data: 订单簿深度（可选）
+            symbol: 交易对
+
+        Returns:
+            dict: 包含所有分析结果
+        """
+        # 基础分析
+        all_signals = self.analyze(trades)
+        consensus, confidence = self.get_consensus()
+        current_price = float(trades[-1]["p"]) if trades else 0
+
+        # 1. 市场状态
+        self._regime_cache = self.regime_detector.detect(
+            self.delta.history, self.volume_profile, current_price, trades
+        )
+
+        # 2. 订单簿失衡
+        if depth_data:
+            self._book_cache = self.book_imbalance.analyze(depth_data)
+        else:
+            self._book_cache = {"ratio": 1.0, "bias": "neutral"}
+
+        # 3. 多时间框架
+        self._mtf_cache = self.mtf.analyze(trades)
+
+        # 4. ATR
+        atr_pct = self.atr.get_atr_pct(current_price)
+
+        # 5. 自适应参数
+        adaptive_params = self.adaptive.get_params(atr_pct, self._regime_cache["regime"])
+
+        # 6. 信号加权（加入新因子）
+        enhanced_consensus, enhanced_confidence = self._calc_enhanced_consensus(
+            consensus, confidence, self._regime_cache, self._mtf_cache, self._book_cache
+        )
+
+        return {
+            "price": current_price,
+            "signals": all_signals,
+            "consensus": enhanced_consensus,
+            "confidence": enhanced_confidence,
+            "regime": self._regime_cache,
+            "mtf": self._mtf_cache,
+            "book": self._book_cache,
+            "atr_pct": atr_pct,
+            "adaptive_params": adaptive_params,
+        }
+
+    def _calc_enhanced_consensus(self, base_consensus, base_confidence,
+                                  regime, mtf, book):
+        """综合所有因子计算增强版共识"""
+        # 基础分数
+        score = 0
+        if base_consensus == "bullish":
+            score = base_confidence * 50
+        elif base_consensus == "bearish":
+            score = -base_confidence * 50
+
+        # 多时间框架加权
+        mtf_score = mtf.get("score", 0) * 15  # 最大 ±45
+
+        # 订单簿加权
+        book_bias = book.get("bias", "neutral")
+        book_score = 0
+        if book_bias == "bullish":
+            book_score = 10
+        elif book_bias == "bearish":
+            book_score = -10
+
+        # 市场状态调整
+        regime_regime = regime.get("regime", "ranging")
+        regime_adj = {
+            MarketRegimeDetector.REGIME_TRENDING_UP: 1.2,
+            MarketRegimeDetector.REGIME_TRENDING_DOWN: 1.2,
+            MarketRegimeDetector.REGIME_RANGING: 0.8,
+            MarketRegimeDetector.REGIME_BREAKOUT: 1.3,
+            MarketRegimeDetector.REGIME_LOW_VOL: 0.5,
+        }
+        mult = regime_adj.get(regime_regime, 1.0)
+
+        total_score = (score + mtf_score + book_score) * mult
+
+        # 转换回共识
+        if total_score > 30:
+            return "bullish", min(0.95, abs(total_score) / 100)
+        elif total_score < -30:
+            return "bearish", min(0.95, abs(total_score) / 100)
+        else:
+            return "neutral", max(0, 1 - abs(total_score) / 30)
 
 
 # ==================== 快捷函数 ====================
