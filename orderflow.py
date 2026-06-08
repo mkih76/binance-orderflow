@@ -812,84 +812,115 @@ class AbsorptionDetector:
     2. Net Taker Imbalance > 60% 或 < -60%（极端方向性）
     3. Relative Price Impact < 0.8（价格几乎没动）
 
-    改进：按成交量高低分别建基线，避免高波动时段误判
+    改进：按市场状态（trending/ranging/breakout）分别建基线，
+    避免趋势行情中高成交量被误判为吸收。
     """
+
+    # 市场状态分组
+    REGIME_GROUPS = {
+        "trending": ["trending_up", "trending_down"],
+        "breakout": ["breakout"],
+        "ranging":  ["ranging", "low_vol"],
+    }
 
     def __init__(self, z_threshold=3.0, imbalance_threshold=0.6, price_impact_threshold=0.8):
         self.z_threshold = z_threshold
         self.imbalance_threshold = imbalance_threshold
         self.price_impact_threshold = price_impact_threshold
-        self.volume_history = deque(maxlen=100)
-        self.price_impact_history = deque(maxlen=50)
-    
-    def detect(self, trades, window_seconds=60):
+        # 按市场状态分别存储基线
+        self.volume_history = {
+            "trending": deque(maxlen=100),
+            "breakout": deque(maxlen=100),
+            "ranging":  deque(maxlen=100),
+        }
+        self.price_impact_history = {
+            "trending": deque(maxlen=50),
+            "breakout": deque(maxlen=50),
+            "ranging":  deque(maxlen=50),
+        }
+
+    def _regime_group(self, regime):
+        """将具体市场状态映射到分组"""
+        if not regime:
+            return "ranging"
+        for group, members in self.REGIME_GROUPS.items():
+            if regime in members:
+                return group
+        return "ranging"
+
+    def detect(self, trades, window_seconds=60, regime=None):
         """
         检测吸收事件
-        
+
         Args:
             trades: aggTrades 列表
             window_seconds: 检测窗口（秒）
-        
+            regime: 当前市场状态（trending_up/trending_down/ranging/breakout/low_vol）
+
         Returns:
             list of absorption events
         """
         if not trades:
             return []
-        
+
+        group = self._regime_group(regime)
+        vol_hist = self.volume_history[group]
+        impact_hist = self.price_impact_history[group]
+
         # 按时间窗口分组
         windows = defaultdict(list)
         for t in trades:
             window_key = int(t["T"] / 1000 / window_seconds) * window_seconds
             windows[window_key].append(t)
-        
+
         signals = []
-        
+
         for window_time, window_trades in windows.items():
             if len(window_trades) < 10:
                 continue
-            
+
             # 计算指标
             total_vol = sum(float(t["q"]) for t in window_trades)
             buy_vol = sum(float(t["q"]) for t in window_trades if not t["m"])
             sell_vol = sum(float(t["q"]) for t in window_trades if t["m"])
-            
-            # 1. Volume Z-Score
-            self.volume_history.append(total_vol)
-            if len(self.volume_history) < 10:
+
+            # 1. Volume Z-Score（基于当前市场状态的基线）
+            vol_hist.append(total_vol)
+            if len(vol_hist) < 10:
                 continue
-            
-            mean_vol = sum(self.volume_history) / len(self.volume_history)
-            std_vol = math.sqrt(sum((v - mean_vol) ** 2 for v in self.volume_history) / len(self.volume_history))
-            
+
+            mean_vol = sum(vol_hist) / len(vol_hist)
+            std_vol = math.sqrt(sum((v - mean_vol) ** 2 for v in vol_hist) / len(vol_hist))
+
             if std_vol == 0:
                 continue
-            
+
             z_score = (total_vol - mean_vol) / std_vol
-            
+
             # 2. Net Taker Imbalance
             net_imbalance = (buy_vol - sell_vol) / total_vol if total_vol > 0 else 0
-            
-            # 3. Relative Price Impact
+
+            # 3. Relative Price Impact（基于当前市场状态的基线）
             prices = [float(t["p"]) for t in window_trades]
             price_range = max(prices) - min(prices)
             mid_price = (max(prices) + min(prices)) / 2
             relative_impact = price_range / mid_price * 100 if mid_price > 0 else 1
-            
-            # 归一化价格影响（相对于历史波动）
-            self.price_impact_history.append(relative_impact)
-            if len(self.price_impact_history) >= 5:
-                avg_impact = sum(self.price_impact_history) / len(self.price_impact_history)
+
+            # 归一化价格影响
+            impact_hist.append(relative_impact)
+            if len(impact_hist) >= 5:
+                avg_impact = sum(impact_hist) / len(impact_hist)
                 normal_impact = relative_impact / avg_impact if avg_impact > 0 else 1
             else:
-                normal_impact = 1  # 数据不足，默认不算吸收
-            
+                normal_impact = 1
+
             # 检测吸收
             if z_score > self.z_threshold:
                 if abs(net_imbalance) > self.imbalance_threshold:
                     if normal_impact < self.price_impact_threshold:
                         direction = "buyer_absorption" if net_imbalance > 0 else "seller_absorption"
                         bias = "bullish" if direction == "seller_absorption" else "bearish"
-                        
+
                         signals.append({
                             "time": window_time,
                             "type": "absorption",
@@ -902,8 +933,9 @@ class AbsorptionDetector:
                             "buy_vol": buy_vol,
                             "sell_vol": sell_vol,
                             "price": mid_price,
+                            "regime": group,
                         })
-        
+
         return signals
 
 # ==================== 6. 衰竭检测 (Exhaustion) ====================
@@ -1231,7 +1263,7 @@ class OrderFlowSignalEngine:
         self.volume_profile.add_trades(trades)
         self.speed.add_trades(trades)
     
-    def analyze(self, trades):
+    def analyze(self, trades, regime=None):
         """运行全部分析，返回信号"""
         all_signals = []
 
@@ -1249,8 +1281,8 @@ class OrderFlowSignalEngine:
                 s["source"] = "cross_bar_imbalance"
                 all_signals.append(s)
 
-        # 2. 吸收
-        abs_signals = self.absorption.detect(trades)
+        # 2. 吸收（按市场状态建基线）
+        abs_signals = self.absorption.detect(trades, regime=regime)
         for s in abs_signals:
             s["source"] = "absorption"
             all_signals.append(s)
@@ -2213,15 +2245,17 @@ class EnhancedSignalEngine(OrderFlowSignalEngine):
         Returns:
             dict: 包含所有分析结果
         """
-        # 基础分析
-        all_signals = self.analyze(trades)
-        consensus, confidence = self.get_consensus()
         current_price = float(trades[-1]["p"]) if trades else 0
 
-        # 1. 市场状态
+        # 1. 市场状态（先算，供吸收检测器分基线用）
         self._regime_cache = self.regime_detector.detect(
             self.delta.history, self.volume_profile, current_price, trades
         )
+        regime = self._regime_cache.get("regime") if self._regime_cache else None
+
+        # 基础分析（传入市场状态）
+        all_signals = self.analyze(trades, regime=regime)
+        consensus, confidence = self.get_consensus()
 
         # 2. 订单簿失衡
         if depth_data:
