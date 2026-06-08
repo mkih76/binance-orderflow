@@ -2409,15 +2409,43 @@ class MarketReasoning:
             rule_report["reasoning_steps"] = [
                 {"thought": ai_result.get("analysis", "")},
             ]
-            if ai_result.get("verdict"):
-                rule_report["verdict"] = ai_result["verdict"]
-                rule_report["verdict_zh"] = {"LONG": "做多", "SHORT": "做空", "WAIT": "观望", "AVOID": "回避"}.get(ai_result["verdict"], "观望")
+
+            # === 防幻觉校验：AI 的结论必须与实际信号匹配 ===
+            ai_verdict = ai_result.get("verdict", "WAIT")
+            if ai_verdict in ("LONG", "SHORT"):
+                # 统计实际信号数量
+                bull_sources = set()
+                bear_sources = set()
+                for s in signals:
+                    src = s.get("source", "")
+                    bias = s.get("bias", "neutral")
+                    if bias == "bullish":
+                        bull_sources.add(src)
+                    elif bias == "bearish":
+                        bear_sources.add(src)
+
+                if ai_verdict == "LONG" and len(bull_sources) < 2:
+                    ai_verdict = "WAIT"
+                    ai_result["verdict_reason"] = f"[AI幻觉拦截] AI说做多但只有{len(bull_sources)}个多方信号，不足2个"
+                elif ai_verdict == "SHORT" and len(bear_sources) < 2:
+                    ai_verdict = "WAIT"
+                    ai_result["verdict_reason"] = f"[AI幻觉拦截] AI说做空但只有{len(bear_sources)}个空方信号，不足2个"
+
+            if ai_verdict in ("LONG", "SHORT", "WAIT", "AVOID"):
+                rule_report["verdict"] = ai_verdict
+                rule_report["verdict_zh"] = {"LONG": "做多", "SHORT": "做空", "WAIT": "观望", "AVOID": "回避"}[ai_verdict]
             if ai_result.get("confidence"):
-                rule_report["confidence"] = ai_result["confidence"]
+                rule_report["confidence"] = min(ai_result["confidence"], 90)  # 上限90，防止过度自信
             if ai_result.get("verdict_reason"):
                 rule_report["verdict_reason"] = ai_result["verdict_reason"]
             if ai_result.get("action_plan"):
-                rule_report["action_plan"].update(ai_result["action_plan"])
+                # 校验止损止盈合理性
+                ap = ai_result["action_plan"]
+                if ap.get("stop_loss") and ap.get("entry"):
+                    sl_dist = abs(ap["entry"] - ap["stop_loss"]) / ap["entry"] * 100
+                    if sl_dist > 3.0:  # 止损超过3%不合理
+                        ap["stop_loss"] = None
+                rule_report["action_plan"].update(ap)
             return rule_report
         else:
             # AI 调用失败，回退到规则引擎
@@ -2426,72 +2454,112 @@ class MarketReasoning:
 
     def _build_context(self, price, poc, vah, val, cvd, delta, signals, trades,
                        depth_bids, depth_asks, regime, atr_pct):
-        """构建发给 AI 的市场上下文"""
-        # 价格趋势
-        recent_prices = [float(t["p"]) for t in trades[-100:]]
-        price_change = (recent_prices[-1] - recent_prices[0]) / recent_prices[0] * 100 if recent_prices else 0
+        """构建发给 AI 的市场上下文 — 严格约束，防止幻觉"""
 
-        # 成交量
+        # 预处理：只给 AI 关键数据，不给原始成交列表
+        recent_prices = [float(t["p"]) for t in trades[-100:]]
+        price_high = max(recent_prices) if recent_prices else price
+        price_low = min(recent_prices) if recent_prices else price
+        price_trend = "上涨" if recent_prices[-1] > recent_prices[0] else "下跌" if recent_prices[-1] < recent_prices[0] else "横盘"
+
         recent_vols = [float(t["q"]) for t in trades[-100:]]
         avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
 
-        # 信号摘要
-        signal_summary = []
+        # 预处理信号：只提取有信号的类型，不给 AI 原始列表
+        signal_evidence = []
+        has_stacked_buy = False
+        has_stacked_sell = False
+        has_absorption = False
+        has_exhaustion = False
+        has_iceberg = False
         for s in signals:
-            signal_summary.append(f"- {s.get('source','?')}: {s.get('bias','neutral')} ({s.get('type','')})")
+            src = s.get("source", "")
+            bias = s.get("bias", "neutral")
+            if src == "stacked_imbalance" and bias == "bullish":
+                has_stacked_buy = True
+                levels = s.get("levels", 0)
+                signal_evidence.append(f"买方堆叠失衡 {levels} 层")
+            elif src == "stacked_imbalance" and bias == "bearish":
+                has_stacked_sell = True
+                levels = s.get("levels", 0)
+                signal_evidence.append(f"卖方堆叠失衡 {levels} 层")
+            elif src == "absorption":
+                has_absorption = True
+                direction = s.get("direction", "")
+                z = s.get("z_score", 0)
+                signal_evidence.append(f"吸收事件 ({direction}, Z={z:.1f})")
+            elif src == "exhaustion":
+                has_exhaustion = True
+                signal_evidence.append(f"成交量衰竭 ({bias})")
+            elif src == "iceberg":
+                has_iceberg = True
+                signal_evidence.append("冰山单")
+
+        n_signals = len(signal_evidence)
 
         # 订单簿
-        book_info = ""
+        book_info = "无数据"
         if depth_bids and depth_asks:
-            max_bid = max(q for _, q in depth_bids) if depth_bids else 0
-            max_ask = max(q for _, q in depth_asks) if depth_asks else 0
             bid_total = sum(q for _, q in depth_bids[:5])
             ask_total = sum(q for _, q in depth_asks[:5])
-            book_info = f"买盘前5总量: {bid_total:.2f}, 卖盘前5总量: {ask_total:.2f}, 最大买单: {max_bid:.2f}, 最大卖单: {max_ask:.2f}"
+            book_info = f"买盘前5: {bid_total:.2f} BTC, 卖盘前5: {ask_total:.2f} BTC, 买卖比: {bid_total/ask_total:.2f}" if ask_total > 0 else f"买盘前5: {bid_total:.2f} BTC"
 
-        context = f"""你是一个资深加密货币交易员，正在分析 BTCUSDT 合约的订单流数据。
+        context = f"""# 交易指令 — 严格执行
 
-## 当前市场数据
-- 当前价格: {price:.1f}
-- POC (成交量重心): {poc or 'N/A'}
-- VAH (价值区上沿): {vah or 'N/A'}
-- VAL (价值区下沿): {val or 'N/A'}
-- CVD (累积成交量差): {cvd:+.0f}
-- Delta (当前K线): {delta:+.0f}
-- ATR 波动率: {atr_pct:.2f}% (如果有的话)
-- 市场状态: {regime.get('regime', 'unknown') if regime else 'unknown'}
+你是一个订单流分析执行器。你必须严格按照下面的交易策略规则判断，不允许自由发挥、不允许凭"直觉"、不允许发明策略中没有的信号。
 
-## 价格动态
-- 最近100笔价格变化: {price_change:+.2f}%
-- 平均成交量: {avg_vol:.4f} BTC
+## 策略规则（必须严格执行）
 
-## 订单流信号
-{chr(10).join(signal_summary) if signal_summary else '无明显信号'}
+### 入场条件（满足任意一组即可）
+**信号A: 堆叠失衡+速度**
+- 条件: 3+层堆叠失衡 + 成交速度加速
+- 方向: 失衡方向开仓
+- 止损: 堆叠区间外, 止盈: 2R
 
-## 订单簿深度
-{book_info or '无数据'}
+**信号B: 吸收反转**
+- 条件: Z-Score>3.0 + 单方向失衡>60% + 价格不动 + 在VAH/VAL/POC附近
+- 方向: 被吸收方反转开仓
+- 止损: 吸收区域外, 止盈: POC
 
-请像一个有10年经验的交易员一样分析这个市场。你的分析需要：
-1. 读懂当前市场结构（趋势、位置、关键价位的含义）
-2. 评估订单流质量（CVD是否确认价格走势？有没有背离？）
-3. 判断是否有有效的交易setup
-4. 给出明确的行动建议
+**信号C: CVD背离**
+- 条件: CVD与价格背离 + 价格在VAH/VAL附近 + 成交量衰竭
+- 方向: 背离方向开仓
+- 止损: 背离极值点外, 止盈: POC
 
-请用以下JSON格式回复：
-{{
-  "analysis": "你的详细分析（2-4句话，用交易员的语言，不要说废话）",
-  "verdict": "LONG 或 SHORT 或 WAIT 或 AVOID",
-  "confidence": 0到100的数字,
-  "verdict_reason": "一句话总结为什么这么判断",
-  "action_plan": {{
-    "entry": 入场价格数字,
-    "stop_loss": 止损价格数字,
-    "take_profit": 止盈价格数字,
-    "position_advice": "仓位建议"
-  }}
-}}
+### 必须WAIT的情况（不可入场）
+- 信号不足2个
+- 价格在POC附近（方向不明）
+- 波动率极低（假突破多）
+- 没有任何上述信号
 
-只返回JSON，不要其他内容。"""
+### 你只能判断以下四个结论
+- LONG: 信号A/B/C中至少2个满足且方向一致
+- SHORT: 信号A/B/C中至少2个满足且方向一致
+- WAIT: 信号不足或条件不满足
+- AVOID: 高风险环境（波动率极高、突破追高）
+
+## 当前数据（你只能用这些数据判断）
+
+价格: {price:.1f} (近100笔区间: {price_low:.1f} - {price_high:.1f}, 趋势: {price_trend})
+POC: {poc or 'N/A'}  VAH: {vah or 'N/A'}  VAL: {val or 'N/A'}
+CVD: {cvd:+.0f}  Delta: {delta:+.0f}
+ATR: {atr_pct:.2f}%  市场状态: {regime.get('regime', 'unknown') if regime else 'unknown'}
+平均成交量: {avg_vol:.4f} BTC
+
+### 已检测到的信号事实（你只能基于这些判断，不能发明新的）
+{chr(10).join('- ' + e for e in signal_evidence) if signal_evidence else '- 无任何信号'}
+
+### 订单簿
+{book_info}
+
+## 输出要求
+
+1. 先判断信号A/B/C各满足几个条件（逐条列出，未满足的写"不满足"）
+2. 判断是否满足入场条件
+3. 给出结论
+
+只返回JSON，不要markdown，不要解释：
+{{"analysis":"逐条分析信号A/B/C的满足情况","verdict":"LONG/SHORT/WAIT/AVOID","confidence":0-100,"verdict_reason":"一句话","action_plan":{{"entry":数字,"stop_loss":数字,"take_profit":数字,"position_advice":"仓位建议"}}}}"""
         return context
 
     def _call_ai(self, context, base_url, api_key, model, max_tokens=1000):
@@ -2507,7 +2575,15 @@ class MarketReasoning:
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "你是一个资深加密货币交易员，专注于订单流分析。只返回JSON，不要markdown代码块。"},
+                    {"role": "system", "content": (
+                        "你是订单流分析执行器，不是交易顾问。"
+                        "规则："
+                        "1. 只用用户提供的数据判断，不能编造数据或信号"
+                        "2. 只判断信号A(堆叠失衡)、信号B(吸收)、信号C(CVD背离)三个"
+                        "3. 至少2个信号满足且方向一致才能给出LONG或SHORT"
+                        "4. 信号不足必须返回WAIT"
+                        "5. 只返回JSON，不解释"
+                    )},
                     {"role": "user", "content": context},
                 ],
                 "max_tokens": max_tokens,
