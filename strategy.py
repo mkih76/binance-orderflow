@@ -821,6 +821,170 @@ def run_strategy(dry_run=False):
 
 # ==================== 入口 ====================
 
+def review_trades(last_n=20):
+    """交易复盘"""
+    journal = TradeJournal()
+    journal_file = journal.journal_file
+
+    import json
+    records = []
+    try:
+        with open(journal_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+    except FileNotFoundError:
+        print("📭 没有交易日志，先跑几笔交易再来复盘")
+        return
+
+    if not records:
+        print("📭 交易日志为空")
+        return
+
+    # 按 trade_id 分组
+    trades = {}
+    for r in records:
+        tid = r.get("trade_id", "unknown")
+        if tid not in trades:
+            trades[tid] = {"entry": None, "exit": None, "orders": [], "snapshot": None}
+        rtype = r.get("type")
+        if rtype == "entry":
+            trades[tid]["entry"] = r
+        elif rtype == "exit":
+            trades[tid]["exit"] = r
+        elif rtype == "order":
+            trades[tid]["orders"].append(r)
+        elif rtype == "snapshot":
+            trades[tid]["snapshot"] = r
+
+    completed = [(tid, t) for tid, t in trades.items() if t["exit"]]
+    if not completed:
+        print("📭 还没有完成的交易")
+        return
+
+    recent = completed[-last_n:]
+
+    print(f"\n{'='*60}")
+    print(f"  📊 交易复盘（最近 {len(recent)} 笔）")
+    print(f"{'='*60}\n")
+
+    wins = 0
+    losses = 0
+    total_pnl = 0.0
+    total_pnl_pct = 0.0
+    win_hold_times = []
+    loss_hold_times = []
+    signal_win = {}  # 各信号源胜率
+
+    for tid, t in recent:
+        entry = t["entry"]
+        exit_ = t["exit"]
+        snap = t["snapshot"]
+
+        direction = entry.get("direction", "?")
+        entry_price = entry.get("entry_price", 0)
+        exit_price = exit_.get("exit_price", 0)
+        pnl = exit_.get("pnl", 0)
+        pnl_pct = exit_.get("pnl_pct", 0)
+        exit_reason = exit_.get("exit_reason", "?")
+        hold_time = exit_.get("hold_time_minutes", 0)
+        reason = entry.get("reason", "")
+        signals = entry.get("signals", [])
+        stop_loss = entry.get("stop_loss", 0)
+        take_profit = entry.get("take_profit", 0)
+
+        is_win = pnl > 0
+        if is_win:
+            wins += 1
+            win_hold_times.append(hold_time)
+        else:
+            losses += 1
+            loss_hold_times.append(hold_time)
+
+        total_pnl += pnl
+        total_pnl_pct += pnl_pct
+
+        # 信号源胜率统计
+        for s in signals:
+            src = s.get("source", "unknown")
+            if src not in signal_win:
+                signal_win[src] = {"wins": 0, "losses": 0}
+            if is_win:
+                signal_win[src]["wins"] += 1
+            else:
+                signal_win[src]["losses"] += 1
+
+        icon = "🟢" if is_win else "🔴"
+        dir_icon = "📈" if direction == "long" else "📉"
+
+        # 计算实际盈亏比
+        risk = abs(entry_price - stop_loss) if stop_loss else 0
+        reward = abs(exit_price - entry_price)
+        actual_rr = reward / risk if risk > 0 else 0
+
+        print(f"  {icon} {tid} | {dir_icon} {direction.upper()} | {entry.get('time_str', '?')}")
+        print(f"     入场: {entry_price:.1f}  出场: {exit_price:.1f}  SL: {stop_loss:.1f}  TP: {take_profit:.1f}")
+        print(f"     PnL: {pnl:+.4f} USDT ({pnl_pct:+.2f}%)  持仓: {hold_time:.0f}min  盈亏比: {actual_rr:.1f}R")
+        print(f"     出场: {exit_reason}  理由: {reason}")
+
+        if snap:
+            print(f"     市场: POC={snap.get('poc', '?')} VAH={snap.get('vah', '?')} VAL={snap.get('val', '?')} 共识={snap.get('consensus', '?')}")
+
+        # 信号详情
+        if signals:
+            sig_str = ", ".join(f"{s.get('source','?')}({s.get('direction','?')})" for s in signals)
+            print(f"     信号: {sig_str}")
+
+        print()
+
+    # 汇总统计
+    total = wins + losses
+    win_rate = wins / total * 100 if total > 0 else 0
+    avg_win = total_pnl / wins if wins > 0 else 0
+    avg_loss = total_pnl / losses if losses < total and losses > 0 else 0
+    avg_hold_win = sum(win_hold_times) / len(win_hold_times) if win_hold_times else 0
+    avg_hold_loss = sum(loss_hold_times) / len(loss_hold_times) if loss_hold_times else 0
+
+    print(f"{'='*60}")
+    print(f"  📈 汇总统计")
+    print(f"{'='*60}")
+    print(f"  总交易: {total}  胜: {wins}  负: {losses}  胜率: {win_rate:.1f}%")
+    print(f"  总PnL:  {total_pnl:+.4f} USDT ({total_pnl_pct:+.2f}%)")
+    print(f"  平均盈利: {avg_win:+.4f} USDT  平均亏损: {avg_loss:+.4f} USDT")
+    if avg_loss != 0:
+        print(f"  盈亏比:  {abs(avg_win/avg_loss):.2f}:1")
+    print(f"  平均持仓: 胜 {avg_hold_win:.0f}min  负 {avg_hold_loss:.0f}min")
+
+    # 信号源胜率
+    if signal_win:
+        print(f"\n  📊 信号源胜率:")
+        for src, stats in sorted(signal_win.items(), key=lambda x: -(x[1]["wins"]+x[1]["losses"])):
+            t = stats["wins"] + stats["losses"]
+            wr = stats["wins"] / t * 100 if t > 0 else 0
+            print(f"    {src:20s}  {t}笔  胜率 {wr:.0f}%  (胜{stats['wins']}/负{stats['losses']})")
+
+    # 出场原因分布
+    exit_reasons = {}
+    for _, t in recent:
+        er = t["exit"].get("exit_reason", "?")
+        exit_reasons[er] = exit_reasons.get(er, 0) + 1
+    if exit_reasons:
+        print(f"\n  📊 出场原因分布:")
+        for reason, count in sorted(exit_reasons.items(), key=lambda x: -x[1]):
+            print(f"    {reason:20s}  {count}笔 ({count/total*100:.0f}%)")
+
+    print(f"\n{'='*60}\n")
+
+
 if __name__ == "__main__":
-    dry_run = "--dry-run" in sys.argv
-    run_strategy(dry_run=dry_run)
+    if "--review" in sys.argv:
+        n = 20
+        for arg in sys.argv:
+            if arg.isdigit():
+                n = int(arg)
+        review_trades(n)
+    elif "--dry-run" in sys.argv:
+        run_strategy(dry_run=True)
+    else:
+        run_strategy(dry_run=False)
