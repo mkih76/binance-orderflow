@@ -2014,6 +2014,53 @@ class TradeJournal:
 
         self._append(record)
 
+    def log_order(self, trade_id, order_result, direction, qty, price, order_type="entry"):
+        """
+        记录交易所实际订单结果
+
+        Args:
+            trade_id: 交易ID
+            order_result: place_order() 返回的原始数据
+            direction: "long" / "short"
+            qty: 数量
+            price: 价格
+            order_type: "entry" / "close"
+        """
+        import json
+
+        fills = order_result.get("fills", [])
+        avg_price = 0.0
+        total_qty = 0.0
+        total_fee = 0.0
+        for f in fills:
+            f_qty = float(f.get("qty", 0))
+            f_price = float(f.get("price", 0))
+            f_fee = float(f.get("commission", 0))
+            avg_price += f_price * f_qty
+            total_qty += f_qty
+            total_fee += f_fee
+        if total_qty > 0:
+            avg_price /= total_qty
+
+        record = {
+            "type": "order",
+            "trade_id": trade_id,
+            "timestamp": time.time(),
+            "time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "direction": direction,
+            "order_type": order_type,
+            "qty": qty,
+            "requested_price": price,
+            "avg_fill_price": avg_price,
+            "filled_qty": total_qty,
+            "fee": total_fee,
+            "order_id": order_result.get("orderId"),
+            "status": order_result.get("status"),
+            "fills_count": len(fills),
+        }
+
+        self._append(record)
+
     def log_signal_snapshot(self, trade_id, price, cvd, delta, poc, vah, val,
                            consensus, signals):
         """记录信号快照（入场时的市场状态）"""

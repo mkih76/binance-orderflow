@@ -15,6 +15,8 @@
     python trader.py limit-buy BTCUSDT 0.001 50000  # 限价买入
     python trader.py limit-sell BTCUSDT 0.001 70000 # 限价卖出
     python trader.py orders BTCUSDT       # 查挂单
+    python trader.py history BTCUSDT 20   # 历史订单
+    python trader.py trades BTCUSDT 20    # 成交记录
     python trader.py cancel BTCUSDT orderId  # 撤单
     python trader.py positions            # 合约持仓
     python trader.py klines BTCUSDT 1h 10 # K线数据
@@ -331,6 +333,92 @@ def cancel_all_orders(symbol):
         return data
     return None
 
+def get_all_orders(symbol="BTCUSDT", limit=20):
+    """
+    查询历史订单（含已成交、已取消、过期）
+
+    Args:
+        symbol: 交易对
+        limit: 返回条数（默认20，最大1000）
+
+    Returns:
+        list of order dicts, or None
+    """
+    mode = get_current_mode()
+    base = get_base_url(mode)
+
+    if mode.startswith("futures"):
+        url = f"{base}/fapi/v1/allOrders"
+    else:
+        url = f"{base}/api/v3/allOrders"
+
+    params = {"symbol": symbol, "limit": limit}
+    data = api_request("GET", url, params, signed=True, mode=mode)
+    if data:
+        if not data:
+            print("📭 没有历史订单")
+            return data
+        print(f"📋 历史订单 ({len(data)} 个):")
+        for o in data:
+            status = o.get("status", "?")
+            side = o.get("side", "?")
+            qty = o.get("origQty", "?")
+            price = o.get("price", "MARKET")
+            avg_price = o.get("avgPrice", "0")
+            ts = o.get("time", 0)
+            time_str = time.strftime("%m-%d %H:%M", time.localtime(ts / 1000)) if ts else "?"
+            icon = {"FILLED": "✅", "CANCELED": "❌", "EXPIRED": "⏰", "NEW": "🔵"}.get(status, "❓")
+            avg_info = f" avg={avg_price}" if float(avg_price or 0) > 0 else ""
+            print(f"  {icon} [{o['orderId']}] {time_str} {side} {qty} {symbol} @ {price}{avg_info} [{status}]")
+        return data
+    return None
+
+def get_my_trades(symbol="BTCUSDT", limit=20):
+    """
+    查询成交记录（实际撮合的交易）
+
+    Args:
+        symbol: 交易对
+        limit: 返回条数（默认20，最大1000）
+
+    Returns:
+        list of trade dicts, or None
+    """
+    mode = get_current_mode()
+    base = get_base_url(mode)
+
+    if mode.startswith("futures"):
+        url = f"{base}/fapi/v1/userTrades"
+    else:
+        url = f"{base}/api/v3/myTrades"
+
+    params = {"symbol": symbol, "limit": limit}
+    data = api_request("GET", url, params, signed=True, mode=mode)
+    if data:
+        if not data:
+            print("📭 没有成交记录")
+            return data
+        print(f"📊 成交记录 ({len(data)} 笔):")
+        total_pnl = 0.0
+        total_fee = 0.0
+        for t in data:
+            price = float(t.get("price", 0))
+            qty = float(t.get("qty", 0))
+            quote_qty = float(t.get("quoteQty", 0))
+            commission = float(t.get("commission", 0))
+            pnl = float(t.get("realizedPnl", 0))
+            side = t.get("side", "?")
+            ts = t.get("time", 0)
+            time_str = time.strftime("%m-%d %H:%M:%S", time.localtime(ts / 1000)) if ts else "?"
+            maker = "🟡Maker" if t.get("maker", False) else "🔵Taker"
+            pnl_str = f" PnL={pnl:+.4f}" if pnl != 0 else ""
+            print(f"  {time_str} {side} {qty} @ {price:.1f} ({quote_qty:.2f} USDT) fee={commission:.6f}{pnl_str} {maker}")
+            total_pnl += pnl
+            total_fee += commission
+        print(f"\n  合计: PnL={total_pnl:+.4f} USDT, 手续费={total_fee:.6f} USDT")
+        return data
+    return None
+
 def get_positions():
     """查询合约持仓（仅合约模式）"""
     mode = get_current_mode()
@@ -644,6 +732,16 @@ def main():
     
     elif cmd == "positions":
         get_positions()
+
+    elif cmd == "history" or cmd == "all-orders":
+        symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
+        limit = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+        get_all_orders(symbol, limit)
+
+    elif cmd == "trades" or cmd == "my-trades":
+        symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"
+        limit = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+        get_my_trades(symbol, limit)
     
     elif cmd == "klines":
         symbol = sys.argv[2] if len(sys.argv) > 2 else "BTCUSDT"

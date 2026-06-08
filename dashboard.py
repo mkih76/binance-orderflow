@@ -42,7 +42,7 @@ from orderflow import (
     ImbalanceDetector, AbsorptionDetector, ExhaustionDetector,
     IcebergDetector, SpeedOfTape, OrderFlowSignalEngine
 )
-from trader import get_balance, get_positions, place_order, get_base_url, get_current_mode
+from trader import get_balance, get_positions, place_order, get_base_url, get_current_mode, get_all_orders, get_my_trades, api_request
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'orderflow-secret'
@@ -479,6 +479,99 @@ def api_trade(direction, qty):
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
+@app.route('/api/orders')
+def api_orders():
+    """历史订单"""
+    try:
+        from trader import get_base_url, get_current_mode, api_request
+        import time as _time
+        mode = get_current_mode()
+        base = get_base_url(mode)
+        symbol = "BTCUSDT"
+        url = f"{base}/fapi/v1/allOrders" if mode.startswith("futures") else f"{base}/api/v3/allOrders"
+        params = {"symbol": symbol, "limit": 50}
+        data = api_request("GET", url, params, signed=True, mode=mode)
+        orders = []
+        for o in (data or []):
+            ts = o.get("time", 0)
+            orders.append({
+                "orderId": o.get("orderId"),
+                "side": o.get("side"),
+                "type": o.get("type"),
+                "origQty": o.get("origQty"),
+                "price": o.get("price"),
+                "avgPrice": o.get("avgPrice", "0"),
+                "status": o.get("status"),
+                "time": ts,
+                "time_str": _time.strftime("%m-%d %H:%M", _time.localtime(ts / 1000)) if ts else "",
+            })
+        return jsonify({"ok": True, "orders": orders})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route('/api/trades')
+def api_trades():
+    """成交记录"""
+    try:
+        from trader import get_base_url, get_current_mode, api_request
+        import time as _time
+        mode = get_current_mode()
+        base = get_base_url(mode)
+        symbol = "BTCUSDT"
+        url = f"{base}/fapi/v1/userTrades" if mode.startswith("futures") else f"{base}/api/v3/myTrades"
+        params = {"symbol": symbol, "limit": 50}
+        data = api_request("GET", url, params, signed=True, mode=mode)
+        trades = []
+        total_pnl = 0.0
+        for t in (data or []):
+            pnl = float(t.get("realizedPnl", 0))
+            ts = t.get("time", 0)
+            trades.append({
+                "side": t.get("side"),
+                "qty": t.get("qty"),
+                "price": t.get("price"),
+                "quoteQty": t.get("quoteQty"),
+                "commission": t.get("commission"),
+                "realizedPnl": pnl,
+                "maker": t.get("maker", False),
+                "time": ts,
+                "time_str": _time.strftime("%m-%d %H:%M:%S", _time.localtime(ts / 1000)) if ts else "",
+            })
+            total_pnl += pnl
+        return jsonify({"ok": True, "trades": trades, "total_pnl": round(total_pnl, 4)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route('/api/positions')
+def api_positions():
+    """当前持仓"""
+    try:
+        mode = get_current_mode()
+        base = get_base_url(mode)
+        if not mode.startswith("futures"):
+            return jsonify({"ok": True, "positions": []})
+        url = f"{base}/fapi/v2/positionRisk"
+        data = api_request("GET", url, signed=True, mode=mode)
+        positions = []
+        for p in (data or []):
+            amt = float(p.get("positionAmt", 0))
+            if amt == 0:
+                continue
+            positions.append({
+                "symbol": p.get("symbol"),
+                "side": "多" if amt > 0 else "空",
+                "amt": abs(amt),
+                "entryPrice": p.get("entryPrice"),
+                "markPrice": p.get("markPrice"),
+                "unRealizedProfit": p.get("unRealizedProfit"),
+                "leverage": p.get("leverage"),
+                "liquidationPrice": p.get("liquidationPrice"),
+                "marginType": p.get("marginType"),
+            })
+        return jsonify({"ok": True, "positions": positions})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 # ==================== HTML 模板 ====================
 
 DASHBOARD_HTML = """
@@ -615,6 +708,28 @@ body { background: #0a0a0f; color: #e0e0e0; font-family: 'SF Mono', 'Fira Code',
     <div class="card">
       <div class="card-title">📋 信号日志</div>
       <div id="signalLog" style="max-height:150px;overflow-y:auto;font-size:11px;"></div>
+    </div>
+  </div>
+
+  <!-- 底部: 持仓 + 订单 + 成交（全宽）-->
+  <div class="card" style="grid-column: 1 / -1;">
+    <div class="card-title">📦 持仓 / 订单 / 成交 <button onclick="refreshOrders()" style="float:right;background:#1e1e2e;color:#aaa;border:1px solid #333;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px;">刷新</button></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+      <!-- 持仓 -->
+      <div>
+        <div style="font-size:12px;font-weight:bold;color:#888;margin-bottom:6px;">📊 当前持仓</div>
+        <div id="positionsList" style="max-height:180px;overflow-y:auto;font-size:11px;">加载中...</div>
+      </div>
+      <!-- 历史订单 -->
+      <div>
+        <div style="font-size:12px;font-weight:bold;color:#888;margin-bottom:6px;">📋 历史订单</div>
+        <div id="ordersList" style="max-height:180px;overflow-y:auto;font-size:11px;">加载中...</div>
+      </div>
+      <!-- 成交记录 -->
+      <div>
+        <div style="font-size:12px;font-weight:bold;color:#888;margin-bottom:6px;">💰 成交记录 <span id="totalPnl" style="float:right;"></span></div>
+        <div id="tradesList" style="max-height:180px;overflow-y:auto;font-size:11px;">加载中...</div>
+      </div>
     </div>
   </div>
 
@@ -960,6 +1075,90 @@ socket.on('update', (d) => {
 setInterval(() => {
   document.getElementById('clock').textContent = new Date().toISOString().substring(11,19) + ' UTC';
 }, 1000);
+
+// === 持仓 / 订单 / 成交 ===
+function refreshOrders() {
+  // 持仓
+  fetch('/api/positions').then(r=>r.json()).then(d => {
+    const el = document.getElementById('positionsList');
+    if (!d.ok || !d.positions || d.positions.length === 0) {
+      el.innerHTML = '<div style="color:#666">📭 无持仓</div>';
+      return;
+    }
+    let html = '';
+    d.positions.forEach(p => {
+      const isLong = p.side === '多';
+      const color = isLong ? '#00d4aa' : '#ff4757';
+      const pnl = parseFloat(p.unRealizedProfit || 0);
+      const pnlColor = pnl >= 0 ? '#00d4aa' : '#ff4757';
+      html += '<div style="padding:4px 0;border-bottom:1px solid #1a1a2e">';
+      html += '<span style="color:' + color + ';font-weight:bold">' + p.side + '</span> ';
+      html += '<span>' + p.amt + ' ' + p.symbol + '</span> ';
+      html += '<span style="color:#888">@ ' + fmt(parseFloat(p.entryPrice),1) + '</span><br>';
+      html += '<span style="color:#666">标记: ' + fmt(parseFloat(p.markPrice),1) + '</span> ';
+      html += '<span style="color:' + pnlColor + '">浮盈: ' + pnl.toFixed(4) + ' USDT</span> ';
+      html += '<span style="color:#666">杠杆: ' + p.leverage + 'x</span>';
+      html += '</div>';
+    });
+    el.innerHTML = html;
+  }).catch(() => { document.getElementById('positionsList').innerHTML = '<div style="color:#666">加载失败</div>'; });
+
+  // 历史订单
+  fetch('/api/orders').then(r=>r.json()).then(d => {
+    const el = document.getElementById('ordersList');
+    if (!d.ok || !d.orders || d.orders.length === 0) {
+      el.innerHTML = '<div style="color:#666">📭 无历史订单</div>';
+      return;
+    }
+    let html = '';
+    d.orders.slice(0, 15).forEach(o => {
+      const statusIcons = {FILLED:'✅', CANCELED:'❌', EXPIRED:'⏰', NEW:'🔵', PARTIALLY_FILLED:'🟡'};
+      const icon = statusIcons[o.status] || '❓';
+      const sideColor = o.side === 'BUY' ? '#00d4aa' : '#ff4757';
+      const avgP = parseFloat(o.avgPrice || 0);
+      const avgStr = avgP > 0 ? ' avg=' + fmt(avgP,1) : '';
+      html += '<div style="padding:3px 0;border-bottom:1px solid #1a1a2e">';
+      html += icon + ' <span style="color:' + sideColor + '">' + o.side + '</span> ';
+      html += o.origQty + ' @ ' + o.price + avgStr;
+      html += ' <span style="color:#666">' + o.time_str + '</span>';
+      html += ' <span style="color:#555">[' + o.status + ']</span>';
+      html += '</div>';
+    });
+    el.innerHTML = html;
+  }).catch(() => { document.getElementById('ordersList').innerHTML = '<div style="color:#666">加载失败</div>'; });
+
+  // 成交记录
+  fetch('/api/trades').then(r=>r.json()).then(d => {
+    const el = document.getElementById('tradesList');
+    const pnlEl = document.getElementById('totalPnl');
+    if (!d.ok || !d.trades || d.trades.length === 0) {
+      el.innerHTML = '<div style="color:#666">📭 无成交记录</div>';
+      return;
+    }
+    if (pnlEl && d.total_pnl !== undefined) {
+      const c = d.total_pnl >= 0 ? '#00d4aa' : '#ff4757';
+      pnlEl.innerHTML = '<span style="color:' + c + '">总PnL: ' + d.total_pnl.toFixed(4) + ' USDT</span>';
+    }
+    let html = '';
+    d.trades.slice(0, 15).forEach(t => {
+      const sideColor = t.side === 'BUY' ? '#00d4aa' : '#ff4757';
+      const pnl = parseFloat(t.realizedPnl || 0);
+      const pnlStr = pnl !== 0 ? ' <span style="color:' + (pnl>=0?'#00d4aa':'#ff4757') + '">PnL=' + pnl.toFixed(4) + '</span>' : '';
+      const makerStr = t.maker ? '🟡M' : '🔵T';
+      html += '<div style="padding:3px 0;border-bottom:1px solid #1a1a2e">';
+      html += '<span style="color:' + sideColor + '">' + t.side + '</span> ';
+      html += t.qty + ' @ ' + fmt(parseFloat(t.price),1);
+      html += ' <span style="color:#666">' + t.time_str + '</span>';
+      html += pnlStr + ' ' + makerStr;
+      html += '</div>';
+    });
+    el.innerHTML = html;
+  }).catch(() => { document.getElementById('tradesList').innerHTML = '<div style="color:#666">加载失败</div>'; });
+}
+
+// 首次加载 + 每 60 秒刷新
+refreshOrders();
+setInterval(refreshOrders, 60000);
 
 // === 走势分析（每 2 分钟刷新）===
 function fmtPrice(n) { return n ? '$' + Number(n).toLocaleString(undefined, {maximumFractionDigits:1}) : '--'; }

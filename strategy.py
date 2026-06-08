@@ -452,7 +452,9 @@ def run_strategy(dry_run=False):
                     if not dry_run:
                         cancel_all_orders(cfg["symbol"])
                         close_side = "SELL" if direction == "long" else "BUY"
-                        place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
+                        close_result = place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
+                        if close_result and journal:
+                            journal.log_order(trade_id, close_result, "short" if direction=="long" else "long", pos["qty"], current_price, "close")
 
                     state["daily_pnl"] += pnl_usdt  # 累加绝对金额
                     state["consecutive_losses"] += 1
@@ -476,7 +478,9 @@ def run_strategy(dry_run=False):
                     if not dry_run:
                         cancel_all_orders(cfg["symbol"])
                         close_side = "SELL" if direction == "long" else "BUY"
-                        place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
+                        close_result = place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
+                        if close_result and journal:
+                            journal.log_order(trade_id, close_result, "short" if direction=="long" else "long", pos["qty"], current_price, "close")
 
                     state["daily_pnl"] += pnl_usdt
                     state["consecutive_losses"] = 0
@@ -500,7 +504,9 @@ def run_strategy(dry_run=False):
                     if not dry_run:
                         cancel_all_orders(cfg["symbol"])
                         close_side = "SELL" if direction == "long" else "BUY"
-                        place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
+                        close_result = place_order(cfg["symbol"], close_side, "MARKET", pos["qty"])
+                        if close_result and journal:
+                            journal.log_order(trade_id, close_result, "short" if direction=="long" else "long", pos["qty"], current_price, "close")
 
                     state["daily_pnl"] += pnl_usdt
                     state["open_position"] = None
@@ -610,6 +616,8 @@ def run_strategy(dry_run=False):
                         result = place_order(cfg["symbol"], side, "MARKET", qty)
 
                         if result:
+                            if journal:
+                                journal.log_order(trade_id, result, best.direction, qty, current_price, "entry")
                             state["open_position"] = {
                                 "direction": best.direction,
                                 "entry_price": current_price,
